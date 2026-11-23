@@ -433,6 +433,8 @@ class RecorderReplayFeed:
         market_filter: set[Market] | None = None,
         symbol_filter: set[str] | None = None,
         stream_filter: set[str] | None = None,
+        min_utc_ns: int | None = None,
+        max_utc_ns: int | None = None,
     ) -> "RecorderReplayFeed":
         """Read directly from a verified Recorder partition directory (catalog + sealed/Raw)."""
         from binance_market_data_recorder.normalize.raw import (
@@ -446,6 +448,15 @@ class RecorderReplayFeed:
 
         layout = StorageLayout.from_root(partition_root)
         parsed: list[FeedEvent] = []
+        rec_products: frozenset[tuple[str, str]] | None = None
+        if market_filter and symbol_filter:
+            rec_mkt_map = {Market.SPOT: "spot", Market.USDM: "usdm"}
+            if all(m in rec_mkt_map for m in market_filter):
+                rec_products = frozenset(
+                    (rec_mkt_map[m], sym)
+                    for m in market_filter
+                    for sym in (*symbol_filter, "__GLOBAL__")
+                )
         with Catalog(layout.catalog, read_only=True) as catalog:
             external: dict[str, Path] = {}
             try:
@@ -458,10 +469,36 @@ class RecorderReplayFeed:
                     }
             except Exception:
                 external = {}
-            chunks = load_source_chunks(layout=layout, catalog=catalog, external_roots=external)
+            chunks = load_source_chunks(
+                layout=layout,
+                catalog=catalog,
+                external_roots=external,
+                products=rec_products,
+                start_utc_ns=min_utc_ns,
+                end_utc_ns=(max_utc_ns + 1) if max_utc_ns is not None else None,
+            )
         for chunk in sorted(chunks, key=lambda c: c.manifest["created_at_utc_ns"]):
+            manifest = chunk.manifest
+            c_sym = manifest.get("symbol")
+            if symbol_filter and c_sym and c_sym not in {"__MIXED__", "__GLOBAL__"} and c_sym not in symbol_filter:
+                continue
+            c_stream = manifest.get("stream")
+            if stream_filter and c_stream and c_stream != "__MIXED__" and c_stream not in stream_filter:
+                continue
+            utc_range = manifest.get("receive_time_utc_range_ns")
+            if isinstance(utc_range, dict):
+                c_min = utc_range.get("min")
+                c_max = utc_range.get("max")
+                if min_utc_ns is not None and c_max is not None and int(c_max) < min_utc_ns:
+                    continue
+                if max_utc_ns is not None and c_min is not None and int(c_min) > max_utc_ns:
+                    continue
             for rec in iter_source_records(chunk):
                 env = rec.envelope
+                if min_utc_ns is not None and env.receive_time_utc_ns < min_utc_ns:
+                    continue
+                if max_utc_ns is not None and env.receive_time_utc_ns > max_utc_ns:
+                    continue
                 mkt = _parse_market(env.market)
                 if market_filter and mkt not in market_filter:
                     continue

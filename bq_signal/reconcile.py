@@ -73,7 +73,26 @@ def reconcile_paper_journal(
     parity: ParityReport | None = None
     gap_attr: dict[str, int] = {}
     if recorder_root is not None:
-        rec_stream = list(RecorderReplayFeed.from_recorder_root(recorder_root).iter_events())
+        ts_vals = [
+            ev.receive_time_utc_ns
+            for ev in recorded_events
+            if not isinstance(ev, StreamHealthEvent) and ev.receive_time_utc_ns is not None
+        ]
+        pad_ns = 10_000_000_000  # +/-10s clock/chunk overlap pad
+        min_ns = (min(ts_vals) - pad_ns) if ts_vals else None
+        max_ns = (max(ts_vals) + pad_ns) if ts_vals else None
+        mkt_filter = {ev.market for ev in recorded_events if not isinstance(ev, StreamHealthEvent)} or None
+        sym_filter = {ev.symbol for ev in recorded_events if not isinstance(ev, StreamHealthEvent)} or None
+        rec_stream = list(
+            RecorderReplayFeed.from_recorder_root(
+                recorder_root,
+                market_filter=mkt_filter,
+                symbol_filter=sym_filter,
+                stream_filter={config.stream},
+                min_utc_ns=min_ns,
+                max_utc_ns=max_ns,
+            ).iter_events()
+        )
     elif recorder_events is not None:
         rec_stream = list(recorder_events)
     else:
