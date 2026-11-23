@@ -1,0 +1,204 @@
+"""Sub-millisecond ModelBundle persistence, train-only normalization, and inference."""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+import hashlib
+import json
+from pathlib import Path
+from typing import Any, Sequence
+
+import numpy as np
+
+from .split import purged_embargoed_splits
+
+
+DEFAULT_FEATURES: tuple[str, ...] = (
+    "bbo_imbalance",
+    "ofi",
+    "net_limit_flow",
+    "pcvr",
+    "sweep_cluster",
+    "fragmentation",
+    "fsi",
+    "j_engine",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ModelMetadata:
+    model_id: str
+    kind: str
+    feature_names: tuple[str, ...]
+    schema_hash: str
+    train_mean: tuple[float, ...]
+    train_std: tuple[float, ...]
+    weights: tuple[float, ...]
+    bias: float
+    alpha: float
+
+
+@dataclass(frozen=True, slots=True)
+class TrainReport:
+    model_id: str
+    folds_evaluated: int
+    oos_mse: float
+    oos_corr: float
+    bundle_dir: str
+
+
+class ModelBundle:
+    """Self-contained <1ms causal inference bundle."""
+
+    def __init__(self, metadata: ModelMetadata) -> None:
+        self.metadata = metadata
+        self._feature_names = metadata.feature_names
+        self._mean = np.asarray(metadata.train_mean, dtype=np.float64)
+        self._std = np.asarray(metadata.train_std, dtype=np.float64)
+        self._weights = np.asarray(metadata.weights, dtype=np.float64)
+        self._bias = float(metadata.bias)
+
+    @property
+    def model_id(self) -> str:
+        return self.metadata.model_id
+
+    @property
+    def schema_hash(self) -> str:
+        return self.metadata.schema_hash
+
+    def predict_one(self, features: dict[str, float] | Any) -> float:
+        """Pure in-memory <1ms inference on causal feature snapshot."""
+        vec = np.empty(len(self._feature_names), dtype=np.float64)
+        if isinstance(features, dict):
+            for idx, name in enumerate(self._feature_names):
+                vec[idx] = float(features[name])
+        else:
+            for idx, name in enumerate(self._feature_names):
+                vec[idx] = float(getattr(features, name))
+        normed = (vec - self._mean) / self._std
+        return float(np.dot(normed, self._weights) + self._bias)
+
+    def predict_batch(self, x_matrix: np.ndarray) -> np.ndarray:
+        normed = (x_matrix - self._mean) / self._std
+        return normed @ self._weights + self._bias
+
+    def save(self, models_root: Path) -> Path:
+        out_dir = models_root / self.metadata.model_id
+        out_dir.mkdir(parents=True, exist_ok=True)
+        payload = asdict(self.metadata)
+        (out_dir / "bundle.json").write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        return out_dir
+
+    @classmethod
+    def load(cls, bundle_dir: Path) -> "ModelBundle":
+        raw = json.loads((bundle_dir / "bundle.json").read_text(encoding="utf-8"))
+        meta = ModelMetadata(
+            model_id=str(raw["model_id"]),
+            kind=str(raw["kind"]),
+            feature_names=tuple(raw["feature_names"]),
+            schema_hash=str(raw["schema_hash"]),
+            train_mean=tuple(float(x) for x in raw["train_mean"]),
+            train_std=tuple(float(x) for x in raw["train_std"]),
+            weights=tuple(float(x) for x in raw["weights"]),
+            bias=float(raw["bias"]),
+            alpha=float(raw["alpha"]),
+        )
+        return cls(meta)
+
+
+def _fit_ridge(
+    x_train: np.ndarray, y_train: np.ndarray, alpha: float
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    mean = x_train.mean(axis=0)
+    std = x_train.std(axis=0)
+    std = np.where(std < 1e-9, 1.0, std)
+    xn = (x_train - mean) / std
+    y_mean = float(y_train.mean())
+    yc = y_train - y_mean
+    d = xn.shape[1]
+    gram = xn.T @ xn + alpha * np.eye(d, dtype=np.float64)
+    w = np.linalg.solve(gram, xn.T @ yc)
+    return mean, std, w, y_mean
+
+
+def _schema_hash(feature_names: tuple[str, ...]) -> str:
+    return hashlib.sha256("|".join(feature_names).encode("utf-8")).hexdigest()[:16]
+
+
+def fit_walk_forward_model(
+    rows: Sequence[dict[str, Any]],
+    targets: Sequence[float],
+    label_end_times_ns: Sequence[int],
+    *,
+    model_id: str,
+    models_root: Path,
+    feature_names: tuple[str, ...] = DEFAULT_FEATURES,
+    n_splits: int = 3,
+    embargo_ns: int = 0,
+    alpha: float = 1.0,
+) -> tuple[ModelBundle, TrainReport]:
+    """Fit ModelBundle using Purged+Embargoed Walk-Forward with zero scaler/label leakage."""
+    timestamps = [int(r["timestamp_ns"]) for r in rows]
+    folds = purged_embargoed_splits(
+        timestamps,
+        label_end_times_ns,
+        n_splits=n_splits,
+        embargo_ns=embargo_ns,
+        walk_forward_only=True,
+    )
+    x_all = np.asarray(
+        [[float(r[name]) for name in feature_names] for r in rows],
+        dtype=np.float64,
+    )
+    y_all = np.asarray(targets, dtype=np.float64)
+
+    oos_preds: list[float] = []
+    oos_true: list[float] = []
+    used_folds = 0
+    for fold in folds:
+        if not fold.train_indices or not fold.val_indices:
+            continue
+        used_folds += 1
+        tr = list(fold.train_indices)
+        va = list(fold.val_indices)
+        mean, std, w, b = _fit_ridge(x_all[tr], y_all[tr], alpha)
+        preds = ((x_all[va] - mean) / std) @ w + b
+        oos_preds.extend(preds.tolist())
+        oos_true.extend(y_all[va].tolist())
+
+    if oos_preds:
+        p_arr = np.asarray(oos_preds, dtype=np.float64)
+        t_arr = np.asarray(oos_true, dtype=np.float64)
+        oos_mse = float(np.mean((p_arr - t_arr) ** 2))
+        if p_arr.std() > 1e-12 and t_arr.std() > 1e-12:
+            oos_corr = float(np.corrcoef(p_arr, t_arr)[0, 1])
+        else:
+            oos_corr = 0.0
+    else:
+        oos_mse = 0.0
+        oos_corr = 0.0
+
+    # Fit final causal deployment bundle on all data available at training cutoff
+    mean_f, std_f, w_f, b_f = _fit_ridge(x_all, y_all, alpha)
+    meta = ModelMetadata(
+        model_id=model_id,
+        kind="linear_ridge",
+        feature_names=feature_names,
+        schema_hash=_schema_hash(feature_names),
+        train_mean=tuple(float(v) for v in mean_f),
+        train_std=tuple(float(v) for v in std_f),
+        weights=tuple(float(v) for v in w_f),
+        bias=float(b_f),
+        alpha=alpha,
+    )
+    bundle = ModelBundle(meta)
+    saved_dir = bundle.save(models_root)
+    return bundle, TrainReport(
+        model_id=model_id,
+        folds_evaluated=used_folds,
+        oos_mse=oos_mse,
+        oos_corr=oos_corr,
+        bundle_dir=str(saved_dir),
+    )
