@@ -441,11 +441,24 @@ class RecorderReplayFeed:
         )
         from binance_market_data_recorder.storage.catalog import Catalog
         from binance_market_data_recorder.storage.layout import StorageLayout
+        from binance_market_data_recorder.storage.macos import StorageRegistry
+        from binance_market_data_recorder.storage.platform import volume_adapter
 
         layout = StorageLayout.from_root(partition_root)
         parsed: list[FeedEvent] = []
         with Catalog(layout.catalog, read_only=True) as catalog:
-            chunks = load_source_chunks(layout=layout, catalog=catalog)
+            external: dict[str, Path] = {}
+            try:
+                if catalog.storage_targets():
+                    reg = StorageRegistry(catalog=catalog, volumes=volume_adapter())
+                    external = {
+                        str(s["storage_id"]): Path(str(s["resolved_path"]))
+                        for s in reg.observe_statuses()
+                        if s.get("state") in {"READY", "LOW_SPACE"} and s.get("resolved_path")
+                    }
+            except Exception:
+                external = {}
+            chunks = load_source_chunks(layout=layout, catalog=catalog, external_roots=external)
         for chunk in sorted(chunks, key=lambda c: c.manifest["created_at_utc_ns"]):
             for rec in iter_source_records(chunk):
                 env = rec.envelope
