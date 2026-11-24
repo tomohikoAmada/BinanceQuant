@@ -2,6 +2,7 @@
 
 from .exchange import (
     BinanceSpotRestClient,
+    DropAckAfterSubmitWrapper,
     ExchangeClient,
     ExchangeRejectedError,
     ExchangeTransportError,
@@ -28,6 +29,7 @@ from .risk import HardRiskGuard
 __all__ = [
     "ACTIVE_OR_UNKNOWN_STATES",
     "BinanceSpotRestClient",
+    "DropAckAfterSubmitWrapper",
     "ExchangeClient",
     "ExchangeFill",
     "ExchangeOrderSnapshot",

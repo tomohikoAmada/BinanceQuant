@@ -12,6 +12,7 @@ from bq_backtest.strategy import OrderIntent
 from bq_feed import BookTickerEvent, Market, Stream
 from bq_order import (
     BinanceSpotRestClient,
+    DropAckAfterSubmitWrapper,
     FakeSpotExchange,
     HardRiskGuard,
     HardRiskLimits,
@@ -22,6 +23,7 @@ from bq_order import (
     OrderState,
     SpotCredentials,
 )
+from bq_order.exchange import _fmt_decimal
 from bq_signal import DeployConfig, SignalRunner, reconcile_paper_journal
 
 
@@ -285,3 +287,22 @@ def test_ipc_live_boundary_and_windowed_streaming_reconcile(tmp_path: Path) -> N
     assert report.stage1_entries_checked == 4
     assert report.stage2_parity is not None
     assert report.stage2_parity.matched_count == 2
+
+
+def test_decimal_formatting_and_drop_ack_wrapper(tmp_path: Path) -> None:
+    assert _fmt_decimal(Decimal("1E-5")) == "0.00001"
+    assert _fmt_decimal(Decimal("0.01000")) == "0.01"
+    assert _fmt_decimal(Decimal("100.00")) == "100"
+
+    inner = FakeSpotExchange(fill_price=Decimal("60000"))
+    wrapper = DropAckAfterSubmitWrapper(inner, drop_next_ack=True)
+    ledger = OrderLedger(tmp_path / "wrap.db")
+    guard = OrderExecutionGuard(ledger=ledger, risk_guard=HardRiskGuard(HardRiskLimits()), exchange=wrapper)
+    out = guard.submit_intent(_intent("wrap-1", qty="0.01"), reference_price=Decimal("60000"))
+    assert out.state == OrderState.UNKNOWN_PENDING_RECONCILE
+    recov = guard.recover_pending()
+    assert recov.resolved_count == 1
+    rec = ledger.get_order("wrap-1")
+    assert rec is not None and rec.state == OrderState.FILLED
+    assert wrapper.query_account()["BTC"] == Decimal("0.01")
+    ledger.close()

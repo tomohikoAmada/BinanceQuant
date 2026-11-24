@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from decimal import Decimal
 import hashlib
 import json
@@ -498,7 +498,12 @@ class CausalTradingCore:
 
             if not self.simulate_fills:
                 if self.intent_sink is not None:
-                    self.intent_sink(emitted_intent)
+                    live_intent = emitted_intent
+                    if live_intent.reference_price is None:
+                        ref_px = self.mark_px_by_key.get(key) or self.last_mark_px
+                        if ref_px > 0:
+                            live_intent = replace(emitted_intent, reference_price=ref_px)
+                    self.intent_sink(live_intent)
             else:
                 # Admission check & pre-reservation BEFORE queueing
                 flt = self.filters_by_key.get(key, self.default_filters)

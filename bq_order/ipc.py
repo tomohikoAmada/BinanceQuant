@@ -165,5 +165,6 @@ class OrderIpcClient:
         return json.loads(buf.decode("utf-8").strip())
 
     def __call__(self, intent: OrderIntent) -> None:
-        resp = self.send_command({"cmd": "submit", "intent": serialize_intent(intent, reference_price=self._default_ref_price)})
+        ref = intent.reference_price if intent.reference_price is not None and intent.reference_price > 0 else self._default_ref_price
+        resp = self.send_command({"cmd": "submit", "intent": serialize_intent(intent, reference_price=ref)})
         self.last_responses.append(resp)

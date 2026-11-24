@@ -30,6 +30,13 @@ class ExchangeRejectedError(RuntimeError):
         self.msg = msg
 
 
+def _fmt_decimal(value: Decimal) -> str:
+    txt = format(value, "f")
+    if "." in txt:
+        txt = txt.rstrip("0").rstrip(".")
+    return txt or "0"
+
+
 class ExchangeClient(Protocol):
     def submit_order(
         self,
@@ -47,6 +54,8 @@ class ExchangeClient(Protocol):
     def query_trades(self, *, symbol: str, client_order_id: str) -> tuple[ExchangeFill, ...]: ...
 
     def cancel_order(self, *, symbol: str, client_order_id: str) -> ExchangeOrderSnapshot: ...
+
+    def query_account(self) -> dict[str, Decimal]: ...
 
 
 class FakeSpotExchange:
@@ -273,6 +282,11 @@ class FakeSpotExchange:
         self._orders[client_order_id] = canceled
         return canceled
 
+    def query_account(self) -> dict[str, Decimal]:
+        if self.network_unreachable:
+            raise ExchangeTransportError("fake_network_unreachable")
+        return {"USDT": self.quote_cash, "BTC": self.base_qty}
+
 
 @dataclass(frozen=True, slots=True)
 class SpotCredentials:
@@ -310,7 +324,7 @@ class BinanceSpotRestClient:
     ) -> dict[str, object] | list[dict[str, object]]:
         p = dict(params)
         p["timestamp"] = str(int(time.time() * 1000))
-        p.setdefault("recvWindow", "5000")
+        p.setdefault("recvWindow", "10000")
         query = urllib.parse.urlencode(p)
         sig = hmac.new(
             self._creds.api_secret.encode("utf-8"),
@@ -402,14 +416,14 @@ class BinanceSpotRestClient:
             "symbol": symbol,
             "side": side,
             "type": order_type,
-            "quantity": str(quantity),
+            "quantity": _fmt_decimal(quantity),
             "newClientOrderId": client_order_id,
             "newOrderRespType": "FULL",
         }
         if order_type == "LIMIT":
             if limit_price is None:
                 raise ValueError("LIMIT order requires limit_price")
-            params["price"] = str(limit_price)
+            params["price"] = _fmt_decimal(limit_price)
             params["timeInForce"] = "GTC"
         res = self._signed_request("POST", "/api/v3/order", params)
         assert isinstance(res, dict)
@@ -461,3 +475,60 @@ class BinanceSpotRestClient:
         )
         assert isinstance(res, dict)
         return self._parse_order_payload(res, client_order_id)
+
+    def query_account(self) -> dict[str, Decimal]:
+        res = self._signed_request("GET", "/api/v3/account", {})
+        assert isinstance(res, dict)
+        out: dict[str, Decimal] = {}
+        for item in res.get("balances", []):
+            if not isinstance(item, dict):
+                continue
+            free = Decimal(str(item.get("free", "0")))
+            locked = Decimal(str(item.get("locked", "0")))
+            total = free + locked
+            if total > 0:
+                out[str(item["asset"])] = total
+        return out
+
+
+class DropAckAfterSubmitWrapper:
+    """Thin fault wrapper that transmits to the wrapped ExchangeClient then drops the client ACK once."""
+
+    def __init__(self, inner: ExchangeClient, *, drop_next_ack: bool = False) -> None:
+        self._inner = inner
+        self.drop_next_ack = drop_next_ack
+
+    def submit_order(
+        self,
+        *,
+        symbol: str,
+        side: Literal["BUY", "SELL"],
+        order_type: Literal["MARKET", "LIMIT"],
+        quantity: Decimal,
+        client_order_id: str,
+        limit_price: Decimal | None = None,
+    ) -> ExchangeOrderSnapshot:
+        snap = self._inner.submit_order(
+            symbol=symbol,
+            side=side,
+            order_type=order_type,
+            quantity=quantity,
+            client_order_id=client_order_id,
+            limit_price=limit_price,
+        )
+        if self.drop_next_ack:
+            self.drop_next_ack = False
+            raise ExchangeTransportError("simulated_dropped_ack_after_real_exchange_submit")
+        return snap
+
+    def query_order(self, *, symbol: str, client_order_id: str) -> ExchangeOrderSnapshot | None:
+        return self._inner.query_order(symbol=symbol, client_order_id=client_order_id)
+
+    def query_trades(self, *, symbol: str, client_order_id: str) -> tuple[ExchangeFill, ...]:
+        return self._inner.query_trades(symbol=symbol, client_order_id=client_order_id)
+
+    def cancel_order(self, *, symbol: str, client_order_id: str) -> ExchangeOrderSnapshot:
+        return self._inner.cancel_order(symbol=symbol, client_order_id=client_order_id)
+
+    def query_account(self) -> dict[str, Decimal]:
+        return self._inner.query_account()

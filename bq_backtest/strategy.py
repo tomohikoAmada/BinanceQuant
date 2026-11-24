@@ -46,6 +46,7 @@ class OrderIntent:
     decision_infer_ns: int
     reason: str
     expected_edge_bps: float = 0.0
+    reference_price: Decimal | None = None
 
 
 class BaseStrategy(Protocol):
