@@ -13,8 +13,10 @@ import pytest
 from binance_market_data.common.v1 import enums_pb2
 from binance_market_data.gateway.v1 import gateway_messages_pb2
 
-from bq_feed import BookTickerEvent, GatewayLiveFeed, Market
-from bq_signal import SignalRunner, load_deploy_config, reconcile_paper_journal
+from bq_backtest import BacktestConfig, BacktestEngine, BtcSpotBboRule
+from bq_feed import BookTickerEvent, GatewayLiveFeed, Market, Stream
+from bq_signal import DeployConfig, SignalRunner, load_deploy_config, reconcile_paper_journal
+from bq_signal.cli import main as cli_main
 
 
 def _make_gateway_status() -> gateway_messages_pb2.GatewayStatusSnapshot:
@@ -178,3 +180,91 @@ def test_live_mode_emits_intents_and_memory_stays_bounded(tmp_path: Path) -> Non
     assert summary.intents_emitted > 0
     # Streaming runner keeps only bounded rolling state (< 5 MiB even for 5k events!)
     assert peak < 5 * 1024 * 1024
+
+
+def test_signal_runner_parity_with_backtest_watchdog_append_and_reconcile_guards(tmp_path: Path) -> None:
+    t0 = 1_800_000_000_000_000_000
+    ms = 1_000_000
+
+    # 1. Fail-closed live mode without intent_sink
+    with pytest.raises(ValueError, match="intent_sink"):
+        SignalRunner(DeployConfig(), mode="live")
+
+    # 2. Same arrival delay -> SignalRunner paper and BacktestEngine match identically!
+    def q(seq: int, dt_ns: int, ask: str, bq: str = "40") -> BookTickerEvent:
+        px = Decimal(ask)
+        return BookTickerEvent("BINANCE", Market.SPOT, "BTCUSDT", px - Decimal("0.01"), Decimal(bq), px, Decimal("10"), update_id=seq, receive_time_utc_ns=t0 + dt_ns, delivery_seq=seq)
+
+    traj = [q(1, 0, "100", "40"), q(2, ms // 2, "101", "10"), q(3, 2 * ms, "101", "10")]
+    bt = BacktestEngine().run(traj, BtcSpotBboRule(order_qty=Decimal("1"), max_pos_qty=Decimal("1")), BacktestConfig(network_rtt_ms=1.0))
+    jpath = tmp_path / "sync.jsonl"
+    cfg_delay = DeployConfig(order_qty=Decimal("1"), max_pos_qty=Decimal("1"), model_infer_ms=0.1, network_rtt_ms=1.0)
+    pr = SignalRunner(cfg_delay, mode="paper").run_events(traj, journal_path=jpath)
+    jrows = [json.loads(l) for l in jpath.read_text().splitlines()]
+    settled = [r["fill"] for r in jrows if r["fill"]]
+    assert settled[0]["avg_fill_price"] == bt.ledger[0].avg_fill_price == "101"
+    assert pr.final_cash_quote == bt.metrics["final_cash_quote"]
+
+    # 3. 10s silence watchdog + UTC vs monotonic separation + append-safe restart
+    time_ns = [100]
+    def _env(uid: int) -> gateway_messages_pb2.GatewayEventEnvelope:
+        e = gateway_messages_pb2.GatewayEventEnvelope()
+        bt_p = e.book_ticker
+        bt_p.metadata.market = enums_pb2.MARKET_SPOT
+        bt_p.metadata.venue = enums_pb2.VENUE_BINANCE
+        bt_p.metadata.symbol = "BTCUSDT"
+        bt_p.metadata.receive_time_utc_ns = t0 + time_ns[0]
+        bt_p.update_id = uid
+        bt_p.best_bid_price, bt_p.best_bid_quantity, bt_p.best_ask_price, bt_p.best_ask_quantity = "99.99", "40", "100", "10"
+        return e
+
+    class _SilentStub:
+        def GetGatewayStatus(self, req: Any, timeout: float = 5.0) -> Any:
+            return _make_gateway_status()
+        def SubscribeEvents(self, req: Any) -> Any:
+            yield _env(1)
+            time_ns[0] += 10_000 * ms
+            yield _env(2)
+
+    feed = GatewayLiveFeed(stub=_SilentStub(), clock_ns=lambda: time_ns[0], stale_threshold_ns=5_000 * ms)
+    w_journal = tmp_path / "wd_append.jsonl"
+    SignalRunner(DeployConfig(), live_feed=feed).run_events(
+        feed.subscribe_event_stream(Market.SPOT, "BTCUSDT", Stream.BOOK_TICKER),
+        journal_path=w_journal,
+    )
+    rows1 = [json.loads(l) for l in w_journal.read_text().splitlines()]
+    assert any(r["event"].get("status") == "STALE" for r in rows1)
+    time_ns[0] += 10_000 * ms
+    exp = feed.poll_watchdog()[0]
+    assert exp.observed_time_utc_ns == t0 + time_ns[0]
+
+    # Restart appends cleanly instead of overwriting!
+    SignalRunner(DeployConfig()).run_events([q(3, 0, "100", "10")], journal_path=w_journal)
+    rows2 = [json.loads(l) for l in w_journal.read_text().splitlines()]
+    assert len(rows2) == len(rows1) + 1
+    assert [r["journal_seq"] for r in rows2] == list(range(1, len(rows2) + 1))
+
+    # 4. Empty journal & disjoint Stage 2 reconciliation fail closed (non-accepted) & CLI exit code 1
+    empty_j = tmp_path / "empty.jsonl"
+    empty_j.touch()
+    emp = reconcile_paper_journal(empty_j, DeployConfig(), recorder_events=[])
+    assert not emp.stage1_exact_replay_passed and not emp.accepted
+
+    # 5. Truncated/gap journal sequence rejected in Stage 1
+    bad_j = tmp_path / "tampered.jsonl"
+    tampered_rows = [json.loads(l) for l in w_journal.read_text().splitlines()]
+    tampered_rows[1]["journal_seq"] = 99
+    bad_j.write_text("\n".join(json.dumps(r) for r in tampered_rows) + "\n", encoding="utf-8")
+    tampered_rep = reconcile_paper_journal(bad_j, DeployConfig())
+    assert not tampered_rep.stage1_exact_replay_passed
+
+    # 6. Hand-calculated trajectory: buy 1 @ ask 101 after 1ms jump (cash 120 -> 120 - 101 - 0.101 = 18.899)
+    hand_cfg = DeployConfig(order_qty=Decimal("1"), max_pos_qty=Decimal("1"), initial_cash_quote=Decimal("120"), taker_fee_bps=Decimal("10"), model_infer_ms=0.1, network_rtt_ms=1.0)
+    hand_j = tmp_path / "hand.jsonl"
+    hand_summary = SignalRunner(hand_cfg, mode="paper").run_events(traj, journal_path=hand_j)
+    assert Decimal(hand_summary.final_position_qty) == Decimal("1")
+    assert Decimal(hand_summary.final_cash_quote) == Decimal("18.8990")
+    assert reconcile_paper_journal(hand_j, hand_cfg).stage1_exact_replay_passed
+    toml_f = tmp_path / "deploy.toml"
+    toml_f.write_text(f'market = "SPOT"\nsymbol = "BTCUSDT"\nstream = "book_ticker"\njournal_path = "{empty_j}"\n', encoding="utf-8")
+    assert cli_main(["reconcile", "--config", str(toml_f), "--journal", str(empty_j)]) == 1

@@ -186,6 +186,11 @@ class ReferenceObservationEvent:
     min_notional: Decimal | None = None
     funding_rate_settled: Decimal | None = None
     funding_time_ms: int | None = None
+    symbol_present: bool | None = None
+    trading_status: str | None = None
+    base_asset: str | None = None
+    quote_asset: str | None = None
+    error_code: str | None = None
     source: str = "unknown"
     delivery_seq: int = 0
     quality_flags: tuple[str, ...] = ()

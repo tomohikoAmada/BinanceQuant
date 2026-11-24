@@ -23,6 +23,11 @@ def main(argv: list[str] | None = None) -> int:
     p_run.add_argument("--config", type=Path, required=True)
     p_run.add_argument("--mode", choices=["paper", "live"], default="paper")
     p_run.add_argument("--max-events", type=int, default=None)
+    p_run.add_argument(
+        "--allow-no-sink",
+        action="store_true",
+        help="Explicit diagnostic override allowing --mode live without an execution sink.",
+    )
 
     p_rec = sub.add_parser("reconcile", help="Reconcile paper_journal.jsonl (Stage 1 replay + Stage 2 Recorder)")
     p_rec.add_argument("--config", type=Path, required=True)
@@ -36,8 +41,7 @@ def main(argv: list[str] | None = None) -> int:
         mode: Literal["paper", "live"] = args.mode
         live = GatewayLiveFeed(target=cfg.gateway_target, stale_threshold_ns=cfg.stale_threshold_ns)
         try:
-            strategy, _ = build_strategy(cfg)
-            runner = SignalRunner(cfg, mode=mode, live_feed=live)
+            runner = SignalRunner(cfg, mode=mode, live_feed=live, diagnostic=bool(args.allow_no_sink))
             stream_iter = live.subscribe_event_stream(cfg.market, cfg.symbol, cfg.stream, max_items=args.max_events)
             summary = runner.run_events(stream_iter)
             print(json.dumps(asdict(summary), indent=2, sort_keys=True))
@@ -48,7 +52,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "reconcile":
         report = reconcile_paper_journal(args.journal, cfg, recorder_root=args.recorder_root)
         print(json.dumps(asdict(report), indent=2, default=str, sort_keys=True))
-        return 0 if report.stage1_exact_replay_passed else 1
+        return 0 if report.accepted else 1
 
     return 2
 

@@ -157,8 +157,10 @@ def test_causality_perturbation_and_sensitivity_and_parquet(tmp_path: Path) -> N
 
 
 def test_purged_embargoed_walk_forward_and_sub_1ms_inference(tmp_path: Path) -> None:
-    stream = _sample_stream(40)
-    rows = extract_feature_rows(stream)
+    full_stream = _sample_stream(60)
+    train_stream = full_stream[:28]
+    eval_stream = full_stream[36:]  # strictly post-cutoff out-of-sample window
+    rows = extract_feature_rows(train_stream)
     targets = [float(i % 5 - 2) for i in range(len(rows))]
     # Label horizon spans 2 seconds forward (4 events at 0.5s step)
     end_times = [int(r["timestamp_ns"]) + 2_000_000_000 for r in rows]
@@ -175,6 +177,7 @@ def test_purged_embargoed_walk_forward_and_sub_1ms_inference(tmp_path: Path) -> 
     bundle, report = fit_walk_forward_model(rows, targets, end_times, model_id="m-wf-1", models_root=tmp_path / "models", n_splits=3)
     assert report.folds_evaluated >= 2
     loaded = ModelBundle.load(tmp_path / "models" / "m-wf-1")
+    assert loaded.trained_until_ns == max(end_times)
     t0 = time.perf_counter()
     for _ in range(100):
         score = loaded.predict_one(rows[0])
@@ -182,9 +185,13 @@ def test_purged_embargoed_walk_forward_and_sub_1ms_inference(tmp_path: Path) -> 
     assert isinstance(score, float)
     assert per_call_ms < 1.0
 
-    # Three-stage strategy using ModelBundle obeys causality perturbation too
+    # Pre-cutoff trading on training window must be rejected fail-closed!
     strat_3 = ThreeStageQuantStrategy(model_bundle=loaded, max_spread_bps=50.0, cost_buffer_bps=0.1)
-    assert verify_causality_perturbation(stream, strat_3, split_index=15)
+    with pytest.raises(ValueError, match="Causal model leakage rejected"):
+        BacktestEngine().run(train_stream, strat_3, BacktestConfig(run_id="leak-reject"))
+
+    # Post-cutoff out-of-sample evaluation obeys causality perturbation cleanly
+    assert verify_causality_perturbation(eval_stream, strat_3, split_index=10)
 
 
 def test_mcp_guard_rejects_3_cheat_strategies_and_6_tools_under_64kib(tmp_path: Path) -> None:
@@ -233,3 +240,64 @@ def test_mcp_guard_rejects_3_cheat_strategies_and_6_tools_under_64kib(tmp_path: 
         assert "result" in parsed
         text_payload = parsed["result"]["content"][0]["text"]
         assert len(text_payload.encode("utf-8")) < MAX_RESPONSE_BYTES
+
+
+def test_team_c_causality_spot_accounting_liquidity_drawdown_and_model_cutoff(tmp_path: Path) -> None:
+    t0 = 1_800_000_000_000_000_000
+    ms = 1_000_000
+
+    def q(seq: int, dt_ns: int, *, ask: str = "100", bid_qty: str = "40", ask_qty: str = "10", mkt: Market = Market.SPOT) -> BookTickerEvent:
+        px = Decimal(ask)
+        return BookTickerEvent("BINANCE", mkt, "BTCUSDT", px - Decimal("0.01"), Decimal(bid_qty), px, Decimal(ask_qty), update_id=seq, receive_time_utc_ns=t0 + dt_ns, delivery_seq=seq)
+
+    eng = BacktestEngine()
+    rule = BtcSpotBboRule(order_qty=Decimal("1"), max_pos_qty=Decimal("1"))
+
+    # 1. Future GAP at +10ms must NOT alter earlier t+1.1ms arrival fill!
+    res_live = eng.run([q(1, 0), StreamHealthEvent("BINANCE", Market.SPOT, "BTCUSDT", Stream.BOOK_TICKER, "LIVE", "ok", t0 + 10 * ms, delivery_seq=2)], rule, BacktestConfig(network_rtt_ms=1.0))
+    res_gap = eng.run([q(1, 0), StreamHealthEvent("BINANCE", Market.SPOT, "BTCUSDT", Stream.BOOK_TICKER, "GAP", "gap", t0 + 10 * ms, delivery_seq=2)], rule, BacktestConfig(network_rtt_ms=1.0))
+    assert res_live.ledger[0].status == res_gap.ledger[0].status == "FILLED"
+    assert res_gap.ledger[0].send_ts_ns - t0 == 100_000  # respects declared infer_ns
+
+    # 2. Insufficient cash & in-flight position reservation conservation (no negative cash or 5 BTC burst)
+    res_cash = eng.run([q(1, 0), q(2, 200_000)], rule, BacktestConfig(initial_cash_quote=Decimal("1")))
+    assert Decimal(res_cash.metrics["final_cash_quote"]) == Decimal("1")
+    assert Decimal(res_cash.metrics["final_position_qty"]) == Decimal("0")
+    burst = [q(i + 1, i * 100_000) for i in range(5)] + [StreamHealthEvent("BINANCE", Market.SPOT, "BTCUSDT", Stream.BOOK_TICKER, "LIVE", "ok", t0 + 10 * ms, delivery_seq=6)]
+    res_burst = eng.run(burst, rule, BacktestConfig(network_rtt_ms=1.0))
+    assert Decimal(res_burst.metrics["final_position_qty"]) <= Decimal("1")
+
+    # 3. Hand-calculated real-time drawdown (buy 1@100 from 100 USDT, mid drops to 49.995 -> DD=0.50005)
+    res_dd = eng.run(
+        [q(1, 0), q(2, ms, ask="50", bid_qty="10"), q(3, 2 * ms, ask="100", bid_qty="10")],
+        rule,
+        BacktestConfig(initial_cash_quote=Decimal("100"), taker_fee_bps=Decimal("0"), model_infer_ms=0.0),
+    )
+    assert res_dd.metrics["max_drawdown_ratio"] == pytest.approx(0.50005)
+
+    # 4. Product isolation: USD-M quote ignored by Spot rule; USD-M funding ignored on Spot position
+    funding = ReferenceObservationEvent("BINANCE", Market.USDM, "BTCUSDT", "funding_rate", funding_rate_settled=Decimal("0.01"), funding_time_ms=100, receive_time_utc_ns=t0 + ms, delivery_seq=2)
+    res_mixed = eng.run([q(1, 0), funding, funding], rule, BacktestConfig())
+    assert Decimal(res_mixed.metrics["total_funding_quote"]) == Decimal("0")
+    assert len(eng.run([q(1, 0, mkt=Market.USDM)], rule, BacktestConfig()).intents) == 0
+
+    # 5. End-of-window symmetry: unarrived orders never settle after window end
+    assert eng.run([q(1, 0)], rule, BacktestConfig(model_infer_ms=2.0, network_rtt_ms=0.0)).metrics["pending_at_end_count"] == 1
+    assert eng.run([q(1, 0)], rule, BacktestConfig(model_infer_ms=0.0, network_rtt_ms=2.0)).metrics["pending_at_end_count"] == 1
+
+    # 6. Liquidity atomicity & per-side unchanged ask persistence
+    book = OrderBookView("BTCUSDT", 1, ((Decimal("99.99"), Decimal("1")),), ((Decimal("100"), Decimal("1")),))
+    flt = ExchangeFilters(min_notional=Decimal("80"))
+    sim = FillSimulator()
+    assert sim.execute(OrderIntent("r", Market.SPOT, "BTCUSDT", "BUY", Decimal("0.25"), "MARKET_TAKER", 1, t0, 0, "t"), book, flt).status == "REJECTED_MIN_NOTIONAL"
+    assert sim.execute(OrderIntent("ok", Market.SPOT, "BTCUSDT", "BUY", Decimal("1"), "MARKET_TAKER", 2, t0, 0, "t"), book, flt).status == "FILLED"
+    # Ask side unchanged when only bid side mutates -> 0 ask liquidity remains
+    assert sim.execute(OrderIntent("dup", Market.SPOT, "BTCUSDT", "BUY", Decimal("1"), "MARKET_TAKER", 3, t0, 0, "t"), OrderBookView("BTCUSDT", 2, ((Decimal("99.99"), Decimal("2")),), book.asks), flt).status == "UNFILLED_EMPTY"
+
+    # 7. MCP train_model per-product/healthy-epoch labels + pre-cutoff rejection
+    series = [q(i + 1, i * ms, ask=str(100 + i % 3), bid_qty=str(10 + 3 * (i % 4))) for i in range(18)]
+    srv = QuantitativeMcpServer(tmp_path / "mcp_leak")
+    tr = srv.call_tool("train_model", {"events": [event_to_dict(e) for e in series], "model_id": "m-cutoff"})
+    assert tr["trained_until_ns"] > t0
+    with pytest.raises(ValueError, match="Causal model leakage rejected"):
+        srv.call_tool("run_backtest", {"events": [event_to_dict(e) for e in series[:10]], "strategy": "three_stage", "model_id": "m-cutoff"})

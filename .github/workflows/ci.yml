@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  python-tests:
+    name: Python tests (Ubuntu 3.12)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Checkout Contracts & Recorder Python baselines
+        run: |
+          git clone --depth 1 https://github.com/tomohikoAmada/BinanceMarketDataContracts.git /tmp/contracts
+          git clone --depth 1 --branch S-BMDR https://github.com/tomohikoAmada/BinanceMarketDataRecorder.git /tmp/recorder
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]" /tmp/contracts /tmp/recorder/vendor/python-baseline
+      - name: Run pytest
+        run: pytest -v

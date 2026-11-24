@@ -48,6 +48,8 @@ class FillResult:
         "REJECTED_UNKNOWN_FILTERS",
         "REJECTED_MIN_NOTIONAL",
         "REJECTED_ZERO_QTY",
+        "REJECTED_INSUFFICIENT_FUNDS",
+        "REJECTED_POSITION_LIMIT",
         "UNFILLED_EMPTY",
     ]
     filled_qty: Decimal
@@ -60,7 +62,7 @@ class FillResult:
 
 
 class FillSimulator:
-    """Deterministic F1 (top-of-book) & F2 (K-level sweep) simulator sharing remaining book qty."""
+    """Deterministic F1 (top-of-book) & F2 (K-level sweep) simulator sharing remaining book qty per side."""
 
     def __init__(
         self,
@@ -74,27 +76,28 @@ class FillSimulator:
         self._fee_bps = taker_fee_bps
         self._fee_asset = fee_asset
         self._max_levels = max_sweep_levels
-        self._book_version_by_sym: dict[str, int] = {}
+        self._last_side_levels: dict[tuple[str, str], tuple[tuple[Decimal, Decimal], ...]] = {}
         self._remaining: dict[tuple[str, str, Decimal], Decimal] = {}
 
     def _sync_book(self, book: OrderBookView) -> None:
-        prev = self._book_version_by_sym.get(book.symbol)
-        if prev != book.book_version:
-            self._book_version_by_sym[book.symbol] = book.book_version
-            # Reset per-snapshot shared available liquidity cleanly
-            stale_keys = [k for k in self._remaining if k[0] == book.symbol]
-            for k in stale_keys:
-                del self._remaining[k]
-            for p, q in book.bids:
-                self._remaining[(book.symbol, "BID", p)] = q
-            for p, q in book.asks:
-                self._remaining[(book.symbol, "ASK", p)] = q
+        # Reset remaining liquidity independently per side ONLY when that side's visible snapshot changed.
+        for side_name, levels in (("BID", book.bids), ("ASK", book.asks)):
+            skey = (book.symbol, side_name)
+            if self._last_side_levels.get(skey) != levels:
+                self._last_side_levels[skey] = levels
+                stale_keys = [k for k in self._remaining if k[0] == book.symbol and k[1] == side_name]
+                for k in stale_keys:
+                    del self._remaining[k]
+                for p, q in levels:
+                    self._remaining[(book.symbol, side_name, p)] = q
 
     def execute(
         self,
         intent: OrderIntent,
         book: OrderBookView,
         filters: ExchangeFilters,
+        *,
+        max_buy_notional_plus_fee: Decimal | None = None,
     ) -> FillResult:
         if not filters.is_known:
             return FillResult("REJECTED_UNKNOWN_FILTERS", Decimal(0), Decimal(0), Decimal(0), Decimal(0), self._fee_asset, 0, "D4_unknown_filters")
@@ -118,10 +121,12 @@ class FillSimulator:
         if req_qty <= 0:
             return FillResult("REJECTED_ZERO_QTY", Decimal(0), Decimal(0), Decimal(0), Decimal(0), self._fee_asset, 0, "below_step_size")
 
+        fee_mult = Decimal(1) + (self._fee_bps / Decimal("10000"))
         remaining_needed = req_qty
         filled_total = Decimal(0)
         notional_total = Decimal(0)
         consumed_lvls = 0
+        tentative: list[tuple[tuple[str, str, Decimal], Decimal]] = []
 
         for idx in range(max_lvls):
             lvl_price_raw, _ = levels[idx]
@@ -130,13 +135,23 @@ class FillSimulator:
             if avail <= 0:
                 continue
             lvl_price = filters.round_tick(lvl_price_raw)
-            take = filters.round_step_down(min(remaining_needed, avail))
+            cap_qty = remaining_needed
+            if intent.side == "BUY" and max_buy_notional_plus_fee is not None and lvl_price > 0:
+                rem_budget = max_buy_notional_plus_fee - notional_total * fee_mult
+                if rem_budget <= 0:
+                    if filled_total == 0:
+                        return FillResult("REJECTED_INSUFFICIENT_FUNDS", Decimal(0), Decimal(0), Decimal(0), Decimal(0), self._fee_asset, 0, "insufficient_quote_cash")
+                    break
+                max_lvl_qty = filters.round_step_down(rem_budget / (lvl_price * fee_mult))
+                cap_qty = min(cap_qty, max_lvl_qty)
+            take = filters.round_step_down(min(cap_qty, avail))
             if take <= 0:
+                if intent.side == "BUY" and max_buy_notional_plus_fee is not None and filled_total == 0:
+                    return FillResult("REJECTED_INSUFFICIENT_FUNDS", Decimal(0), Decimal(0), Decimal(0), Decimal(0), self._fee_asset, 0, "insufficient_quote_cash")
                 continue
-            # Enforce min_notional on single F1 shot or cumulative check at end
             filled_total += take
             notional_total += take * lvl_price
-            self._remaining[key] = avail - take
+            tentative.append((key, avail - take))
             remaining_needed -= take
             consumed_lvls += 1
             if remaining_needed <= 0:
@@ -146,11 +161,18 @@ class FillSimulator:
             return FillResult("UNFILLED_EMPTY", Decimal(0), Decimal(0), Decimal(0), Decimal(0), self._fee_asset, 0, "visible_liquidity_exhausted")
 
         if filters.min_notional is not None and notional_total < filters.min_notional:
-            # Roll back level reservations if min_notional failed atomically!
+            # Zero side effects: do NOT commit tentative liquidity reductions!
             return FillResult("REJECTED_MIN_NOTIONAL", Decimal(0), Decimal(0), Decimal(0), Decimal(0), self._fee_asset, 0, f"notional {notional_total} < min_notional {filters.min_notional}")
 
-        avg_px = notional_total / filled_total
         fee = notional_total * (self._fee_bps / Decimal("10000"))
+        if intent.side == "BUY" and max_buy_notional_plus_fee is not None and (notional_total + fee) > max_buy_notional_plus_fee:
+            return FillResult("REJECTED_INSUFFICIENT_FUNDS", Decimal(0), Decimal(0), Decimal(0), Decimal(0), self._fee_asset, 0, "insufficient_quote_cash")
+
+        # Atomically commit remaining liquidity only after all checks pass
+        for key, new_avail in tentative:
+            self._remaining[key] = new_avail
+
+        avg_px = notional_total / filled_total
         status: Literal["FILLED", "PARTIAL"] = "FILLED" if filled_total >= req_qty else "PARTIAL"
         return FillResult(
             status=status,

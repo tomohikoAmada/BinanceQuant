@@ -16,6 +16,21 @@ class StrategyAccountView:
     cash_quote: Decimal
     last_trade_ts_ns: int = 0
     intent_counter: int = 0
+    reserved_cash_quote: Decimal = Decimal(0)
+    reserved_buy_qty: Decimal = Decimal(0)
+    reserved_sell_qty: Decimal = Decimal(0)
+
+    @property
+    def free_cash_quote(self) -> Decimal:
+        return self.cash_quote - self.reserved_cash_quote
+
+    @property
+    def effective_long_qty(self) -> Decimal:
+        return self.position_qty + self.reserved_buy_qty
+
+    @property
+    def available_sell_qty(self) -> Decimal:
+        return self.position_qty - self.reserved_sell_qty
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,7 +91,7 @@ class BtcSpotBboRule:
     def on_feature(
         self, feat: FeatureVector, account: StrategyAccountView
     ) -> OrderIntent | None:
-        if feat.symbol != self.symbol or not feat.health_valid:
+        if feat.market != self.market.value or feat.symbol != self.symbol or not feat.health_valid:
             return None
         if feat.spread_bps > self._max_spread_bps:
             return None
@@ -85,7 +100,7 @@ class BtcSpotBboRule:
                 return None
 
         if feat.bbo_imbalance >= self._buy_th:
-            headroom = self._max_pos - account.position_qty
+            headroom = self._max_pos - account.effective_long_qty
             qty = min(self._order_qty, headroom)
             if qty > 0:
                 return OrderIntent(
@@ -104,10 +119,10 @@ class BtcSpotBboRule:
 
         if feat.bbo_imbalance <= -self._sell_th:
             if self._allow_short:
-                headroom = account.position_qty + self._max_pos
+                headroom = (account.position_qty - account.reserved_sell_qty) + self._max_pos
                 qty = min(self._order_qty, headroom)
             else:
-                qty = min(self._order_qty, account.position_qty)
+                qty = min(self._order_qty, account.available_sell_qty)
             if qty > 0:
                 return OrderIntent(
                     intent_id=f"{self.strategy_id}-{feat.delivery_seq}-S",
@@ -180,13 +195,13 @@ class ThreeStageQuantStrategy:
     def on_feature(
         self, feat: FeatureVector, account: StrategyAccountView
     ) -> OrderIntent | None:
-        if feat.symbol != self.symbol or not self._regime_allows(feat):
+        if feat.market != self.market.value or feat.symbol != self.symbol or not self._regime_allows(feat):
             return None
         alpha_bps = self._alpha_bps(feat)
         # MetaCostRisk: net edge must exceed half-spread + fee buffer
         net_cost_bps = 0.5 * feat.spread_bps + self._cost_buffer_bps
         if alpha_bps > net_cost_bps:
-            qty = min(self._order_qty, self._max_pos - account.position_qty)
+            qty = min(self._order_qty, self._max_pos - account.effective_long_qty)
             if qty > 0:
                 return OrderIntent(
                     intent_id=f"{self.strategy_id}-{feat.delivery_seq}-B",
@@ -203,9 +218,9 @@ class ThreeStageQuantStrategy:
                 )
         elif -alpha_bps > net_cost_bps:
             if self._allow_short:
-                qty = min(self._order_qty, account.position_qty + self._max_pos)
+                qty = min(self._order_qty, (account.position_qty - account.reserved_sell_qty) + self._max_pos)
             else:
-                qty = min(self._order_qty, account.position_qty)
+                qty = min(self._order_qty, account.available_sell_qty)
             if qty > 0:
                 return OrderIntent(
                     intent_id=f"{self.strategy_id}-{feat.delivery_seq}-S",

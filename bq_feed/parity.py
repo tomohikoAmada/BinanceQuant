@@ -73,8 +73,8 @@ class ParityReport:
     matched_count: int
     recorder_only_count: int
     gateway_only_count: int
-    recorder_coverage: float
-    gateway_coverage: float
+    recorder_coverage: float | None
+    gateway_coverage: float | None
     field_mismatches: list[FieldMismatch] = field(default_factory=list)
     latency_p50_ms: float | None = None
     latency_p95_ms: float | None = None
@@ -83,6 +83,9 @@ class ParityReport:
     gateway_gaps: int = 0
     window_start_ns: int | None = None
     window_end_ns: int | None = None
+    recorder_duplicate_count: int = 0
+    gateway_duplicate_count: int = 0
+    status: str = "PASSED"  # PASSED | NO_DATA | INSUFFICIENT | MISMATCH
 
 
 def _compare_common_fields(
@@ -129,6 +132,7 @@ def compare_overlapping_windows(
     rec_times = [e.receive_time_utc_ns for e in rec_market if e.receive_time_utc_ns is not None]
     gw_times = [e.receive_time_utc_ns for e in gw_market if e.receive_time_utc_ns is not None]
 
+    explicit_window = window_start_ns is not None or window_end_ns is not None
     win_start = window_start_ns
     win_end = window_end_ns
     if (win_start is None or win_end is None) and rec_times and gw_times:
@@ -139,24 +143,73 @@ def compare_overlapping_windows(
 
     def _in_window(ev: FeedEvent) -> bool:
         t = getattr(ev, "receive_time_utc_ns", None)
-        if win_start is None or win_end is None or t is None:
-            return True
-        return win_start <= t <= win_end
+        if t is None:
+            return not explicit_window
+        if win_start is not None and t < win_start:
+            return False
+        if win_end is not None and t > win_end:
+            return False
+        return True
+
+    no_overlap = (
+        not rec_market
+        or not gw_market
+        or (win_start is not None and win_end is not None and win_start > win_end)
+    )
 
     rec_all: dict[tuple[str, str, str, str | None], FeedEvent] = {}
+    rec_dups = 0
     for ev in rec_market:
         ident = event_identity(ev)
-        if ident[3] is not None:
+        if ident[3] is None:
+            continue
+        if explicit_window and not _in_window(ev) and ident in rec_all:
+            continue
+        if ident in rec_all:
+            rec_dups += 1
+        else:
             rec_all[ident] = ev
 
     gw_all: dict[tuple[str, str, str, str | None], FeedEvent] = {}
+    gw_dups = 0
     for ev in gw_market:
         ident = event_identity(ev)
-        if ident[3] is not None:
+        if ident[3] is None:
+            continue
+        if ident in gw_all:
+            gw_dups += 1
+        else:
             gw_all[ident] = ev
 
-    # Matched identities survive boundary arrival clock jitter between collectors.
-    common_keys = set(rec_all) & set(gw_all)
+    if no_overlap:
+        rec_only_n = sum(1 for v in rec_all.values() if _in_window(v)) if (win_start is not None and win_end is not None and win_start <= win_end) else len(rec_all)
+        gw_only_n = sum(1 for v in gw_all.values() if _in_window(v)) if (win_start is not None and win_end is not None and win_start <= win_end) else len(gw_all)
+        st = "NO_DATA" if (not rec_market and not gw_market) else "INSUFFICIENT"
+        return ParityReport(
+            recorder_total=rec_only_n,
+            gateway_total=gw_only_n,
+            matched_count=0,
+            recorder_only_count=rec_only_n,
+            gateway_only_count=gw_only_n,
+            recorder_coverage=None,
+            gateway_coverage=None,
+            field_mismatches=[],
+            recorder_gaps=rec_gaps,
+            gateway_gaps=gw_gaps,
+            window_start_ns=win_start,
+            window_end_ns=win_end,
+            recorder_duplicate_count=rec_dups,
+            gateway_duplicate_count=gw_dups,
+            status=st,
+        )
+
+    # Matched identities survive single-sided edge arrival clock jitter;
+    # under an explicit window, ignore pairs where BOTH sides lie outside the window.
+    common_keys = {
+        k
+        for k in (set(rec_all) & set(gw_all))
+        if (not explicit_window) or _in_window(rec_all[k]) or _in_window(gw_all[k])
+    }
     rec_only_keys = {k for k, v in rec_all.items() if k not in common_keys and _in_window(v)}
     gw_only_keys = {k for k, v in gw_all.items() if k not in common_keys and _in_window(v)}
 
@@ -181,14 +234,25 @@ def compare_overlapping_windows(
         p95 = float(np.percentile(arr, 95))
         p99 = float(np.percentile(arr, 99))
 
+    rec_cov = (matched / rec_n) if rec_n > 0 else None
+    gw_cov = (matched / gw_n) if gw_n > 0 else None
+    if rec_n == 0 and gw_n == 0:
+        status = "NO_DATA"
+    elif matched == 0 or rec_cov is None or gw_cov is None:
+        status = "INSUFFICIENT"
+    elif mismatches or rec_dups > 0 or gw_dups > 0:
+        status = "MISMATCH"
+    else:
+        status = "PASSED"
+
     return ParityReport(
         recorder_total=rec_n,
         gateway_total=gw_n,
         matched_count=matched,
         recorder_only_count=len(rec_only_keys),
         gateway_only_count=len(gw_only_keys),
-        recorder_coverage=(matched / rec_n) if rec_n else 1.0,
-        gateway_coverage=(matched / gw_n) if gw_n else 1.0,
+        recorder_coverage=rec_cov,
+        gateway_coverage=gw_cov,
         field_mismatches=mismatches,
         latency_p50_ms=p50,
         latency_p95_ms=p95,
@@ -197,4 +261,7 @@ def compare_overlapping_windows(
         gateway_gaps=gw_gaps,
         window_start_ns=win_start,
         window_end_ns=win_end,
+        recorder_duplicate_count=rec_dups,
+        gateway_duplicate_count=gw_dups,
+        status=status,
     )

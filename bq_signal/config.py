@@ -36,6 +36,9 @@ class DeployConfig:
     filters_known: bool = True
     initial_cash_quote: Decimal = Decimal("100000")
     journal_path: str = "paper_journal.jsonl"
+    model_infer_ms: float | None = 0.0
+    network_rtt_ms: float = 0.0
+    strict_receive_time: bool = False
     config_hash: str = ""
 
     def to_filters(self) -> ExchangeFilters:
@@ -76,6 +79,12 @@ def load_deploy_config(path: Path) -> DeployConfig:
         "initial_cash_quote": Decimal(str(raw.get("initial_cash_quote", "100000"))),
         "journal_path": str(raw.get("journal_path", "paper_journal.jsonl")),
     }
+    if "model_infer_ms" in raw:
+        cfg_dict["model_infer_ms"] = float(raw["model_infer_ms"]) if raw["model_infer_ms"] is not None else None
+    if "network_rtt_ms" in raw:
+        cfg_dict["network_rtt_ms"] = float(raw["network_rtt_ms"])
+    if "strict_receive_time" in raw:
+        cfg_dict["strict_receive_time"] = bool(raw["strict_receive_time"])
     digest = hashlib.sha256(
         json.dumps(cfg_dict, default=str, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()[:16]

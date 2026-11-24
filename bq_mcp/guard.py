@@ -130,7 +130,25 @@ def validate_strategy_code(
                 return {
                     "valid": False,
                     "stage": "causality_perturbation",
+                    "submitted_source_audited": True,
+                    "perturbation_strategy_id": strategy_instance.strategy_id,
+                    "perturbation_coverage": "runtime_reference",
                     "violations": ["prefix outputs diverged when future events were perturbed"],
                 }
+            return {
+                "valid": True,
+                "stage": "all_passed",
+                "submitted_source_audited": True,
+                "perturbation_strategy_id": strategy_instance.strategy_id,
+                "perturbation_coverage": "runtime_reference",
+                "violations": [],
+            }
 
-    return {"valid": True, "stage": "all_passed", "violations": []}
+    return {
+        "valid": True,
+        "stage": "static_and_parity_passed",
+        "submitted_source_audited": True,
+        "perturbation_strategy_id": None,
+        "perturbation_coverage": "static_ast_only",
+        "violations": [],
+    }

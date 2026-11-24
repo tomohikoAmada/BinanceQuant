@@ -41,6 +41,30 @@ _MARKET_ALIASES = {
     "OPTIONS": Market.OPTIONS,
 }
 
+_MARKET_TO_RECORDER_CANDIDATES: dict[Market, tuple[str, ...]] = {
+    Market.SPOT: ("spot", "SPOT"),
+    Market.USDM: ("um_perpetual", "usdm", "USD_M_PERPETUAL"),
+    Market.COINM: ("cm_perpetual", "coinm", "COIN_M_PERPETUAL"),
+    Market.OPTIONS: ("options", "OPTIONS"),
+}
+
+_STREAM_ALIASES: dict[str, str] = {
+    "rest_observations": Stream.REFERENCE_DATA.value,
+    "reference_data": Stream.REFERENCE_DATA.value,
+    "book_ticker": Stream.BOOK_TICKER.value,
+    "bookTicker": Stream.BOOK_TICKER.value,
+    "agg_trade": Stream.AGG_TRADE.value,
+    "aggTrade": Stream.AGG_TRADE.value,
+    "diff_depth": Stream.DIFF_DEPTH.value,
+    "depth_update": Stream.DIFF_DEPTH.value,
+    "mark_price": Stream.MARK_PRICE.value,
+    "liquidation": Stream.LIQUIDATION.value,
+}
+
+
+def _normalize_manifest_stream(raw_stream: str) -> str:
+    return _STREAM_ALIASES.get(raw_stream, raw_stream)
+
 
 def _parse_market(raw_market: Any) -> Market:
     key = str(raw_market)
@@ -399,8 +423,10 @@ class _SortableEnvelope:
 class RecorderReplayFeed:
     """Reads sealed Recorder chunks or raw records in causal receive-clock order."""
 
-    def __init__(self, events: Iterable[FeedEvent] | None = None) -> None:
+    def __init__(self, events: Iterable[FeedEvent] | None = None, *, loaded_chunks_count: int = 0) -> None:
         self._raw_items: list[FeedEvent] = list(events) if events is not None else []
+        self.loaded_chunks_count = loaded_chunks_count
+        self.skipped_missing_receive_time_count = 0
 
     @classmethod
     def from_raw_records(cls, records: Iterable[dict[str, Any]]) -> "RecorderReplayFeed":
@@ -432,7 +458,7 @@ class RecorderReplayFeed:
         *,
         market_filter: set[Market] | None = None,
         symbol_filter: set[str] | None = None,
-        stream_filter: set[str] | None = None,
+        stream_filter: set[str | Stream] | None = None,
         min_utc_ns: int | None = None,
         max_utc_ns: int | None = None,
     ) -> "RecorderReplayFeed":
@@ -446,16 +472,23 @@ class RecorderReplayFeed:
         from binance_market_data_recorder.storage.macos import StorageRegistry
         from binance_market_data_recorder.storage.platform import volume_adapter
 
+        norm_stream_filter: set[str] | None = None
+        if stream_filter is not None:
+            norm_stream_filter = {
+                _normalize_manifest_stream(s.value if isinstance(s, Stream) else str(s))
+                for s in stream_filter
+            }
+
         layout = StorageLayout.from_root(partition_root)
         parsed: list[FeedEvent] = []
         rec_products: frozenset[tuple[str, str]] | None = None
         if market_filter and symbol_filter:
-            rec_mkt_map = {Market.SPOT: "spot", Market.USDM: "usdm"}
-            if all(m in rec_mkt_map for m in market_filter):
+            if all(m in _MARKET_TO_RECORDER_CANDIDATES for m in market_filter):
                 rec_products = frozenset(
-                    (rec_mkt_map[m], sym)
+                    (rec_mkt, sym)
                     for m in market_filter
-                    for sym in (*symbol_filter, "__GLOBAL__")
+                    for rec_mkt in _MARKET_TO_RECORDER_CANDIDATES[m]
+                    for sym in (*symbol_filter, "__GLOBAL__", "__MIXED__")
                 )
         with Catalog(layout.catalog, read_only=True) as catalog:
             external: dict[str, Path] = {}
@@ -477,14 +510,23 @@ class RecorderReplayFeed:
                 start_utc_ns=min_utc_ns,
                 end_utc_ns=(max_utc_ns + 1) if max_utc_ns is not None else None,
             )
+        selected_chunks = []
         for chunk in sorted(chunks, key=lambda c: c.manifest["created_at_utc_ns"]):
             manifest = chunk.manifest
+            c_mkt_raw = manifest.get("market")
+            if market_filter and c_mkt_raw and c_mkt_raw not in {"__MIXED__", "__GLOBAL__"}:
+                try:
+                    if _parse_market(c_mkt_raw) not in market_filter:
+                        continue
+                except ValueError:
+                    continue
             c_sym = manifest.get("symbol")
             if symbol_filter and c_sym and c_sym not in {"__MIXED__", "__GLOBAL__"} and c_sym not in symbol_filter:
                 continue
             c_stream = manifest.get("stream")
-            if stream_filter and c_stream and c_stream != "__MIXED__" and c_stream not in stream_filter:
-                continue
+            if norm_stream_filter and c_stream and c_stream != "__MIXED__":
+                if _normalize_manifest_stream(str(c_stream)) not in norm_stream_filter:
+                    continue
             utc_range = manifest.get("receive_time_utc_range_ns")
             if isinstance(utc_range, dict):
                 c_min = utc_range.get("min")
@@ -493,6 +535,9 @@ class RecorderReplayFeed:
                     continue
                 if max_utc_ns is not None and c_min is not None and int(c_min) > max_utc_ns:
                     continue
+            selected_chunks.append(chunk)
+
+        for chunk in selected_chunks:
             for rec in iter_source_records(chunk):
                 env = rec.envelope
                 if min_utc_ns is not None and env.receive_time_utc_ns < min_utc_ns:
@@ -502,9 +547,9 @@ class RecorderReplayFeed:
                 mkt = _parse_market(env.market)
                 if market_filter and mkt not in market_filter:
                     continue
-                if symbol_filter and env.symbol != "__GLOBAL__" and env.symbol not in symbol_filter:
+                if symbol_filter and env.symbol not in {"__GLOBAL__", "__MIXED__"} and env.symbol not in symbol_filter:
                     continue
-                if stream_filter and env.stream not in stream_filter:
+                if norm_stream_filter and _normalize_manifest_stream(env.stream) not in norm_stream_filter:
                     continue
                 flags = tuple(getattr(env, "capture_flags", ()))
                 res = parse_raw_record(
@@ -519,21 +564,28 @@ class RecorderReplayFeed:
                 )
                 if res is None:
                     continue
-                if isinstance(res, list):
-                    parsed.extend(res)
-                else:
-                    parsed.append(res)
-        return cls(parsed)
+                items = res if isinstance(res, list) else [res]
+                for item in items:
+                    if symbol_filter and getattr(item, "symbol", None) not in symbol_filter:
+                        continue
+                    if norm_stream_filter and item.stream.value not in norm_stream_filter:
+                        continue
+                    parsed.append(item)
+        return cls(parsed, loaded_chunks_count=len(selected_chunks))
 
-    def iter_events(self) -> Iterator[FeedEvent]:
+    def iter_events(self, *, strict_receive_time: bool = False) -> Iterator[FeedEvent]:
         """Yield sorted MarketEvents and injected StreamHealthEvent gaps with monotonic delivery_seq."""
         bucket: list[_SortableEnvelope] = []
+        self.skipped_missing_receive_time_count = 0
         for idx, ev in enumerate(self._raw_items):
             if isinstance(ev, StreamHealthEvent):
                 t = ev.observed_time_utc_ns
             else:
                 t = ev.receive_time_utc_ns
                 if t is None:
+                    if strict_receive_time:
+                        self.skipped_missing_receive_time_count += 1
+                        continue
                     exch_ms = getattr(ev, "exchange_event_time_ms", None) or getattr(ev, "trade_time_ms", None) or 0
                     t = exch_ms * 1_000_000
             bucket.append(_SortableEnvelope(sort_time_ns=t, source_order=idx, event=ev))

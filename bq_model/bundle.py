@@ -36,6 +36,12 @@ class ModelMetadata:
     weights: tuple[float, ...]
     bias: float
     alpha: float
+    market: str = "SPOT"
+    symbol: str = "BTCUSDT"
+    feature_version: str = "v1"
+    input_digest: str = ""
+    trained_until_ns: int = 0
+    model_digest: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +51,8 @@ class TrainReport:
     oos_mse: float
     oos_corr: float
     bundle_dir: str
+    trained_until_ns: int = 0
+    model_digest: str = ""
 
 
 class ModelBundle:
@@ -65,6 +73,10 @@ class ModelBundle:
     @property
     def schema_hash(self) -> str:
         return self.metadata.schema_hash
+
+    @property
+    def trained_until_ns(self) -> int:
+        return self.metadata.trained_until_ns
 
     def predict_one(self, features: dict[str, float] | Any) -> float:
         """Pure in-memory <1ms inference on causal feature snapshot."""
@@ -104,6 +116,12 @@ class ModelBundle:
             weights=tuple(float(x) for x in raw["weights"]),
             bias=float(raw["bias"]),
             alpha=float(raw["alpha"]),
+            market=str(raw.get("market", "SPOT")),
+            symbol=str(raw.get("symbol", "BTCUSDT")),
+            feature_version=str(raw.get("feature_version", "v1")),
+            input_digest=str(raw.get("input_digest", "")),
+            trained_until_ns=int(raw.get("trained_until_ns", 0)),
+            model_digest=str(raw.get("model_digest", "")),
         )
         return cls(meta)
 
@@ -138,9 +156,27 @@ def fit_walk_forward_model(
     n_splits: int = 3,
     embargo_ns: int = 0,
     alpha: float = 1.0,
+    market: str | None = None,
+    symbol: str | None = None,
+    feature_version: str = "v1",
 ) -> tuple[ModelBundle, TrainReport]:
-    """Fit ModelBundle using Purged+Embargoed Walk-Forward with zero scaler/label leakage."""
+    """Fit ModelBundle using Purged+Embargoed Walk-Forward with provenance & causal cutoff."""
+    if not rows:
+        raise ValueError("Cannot fit model on empty feature rows")
     timestamps = [int(r["timestamp_ns"]) for r in rows]
+    resolved_market = market or str(rows[0].get("market", "SPOT"))
+    resolved_symbol = symbol or str(rows[0].get("symbol", "BTCUSDT"))
+    input_digest = hashlib.sha256(
+        json.dumps(
+            {
+                "market": resolved_market,
+                "symbol": resolved_symbol,
+                "timestamps": [timestamps[0], timestamps[-1], len(rows)],
+                "label_end_max": max(int(x) for x in label_end_times_ns),
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()[:16]
     folds = purged_embargoed_splits(
         timestamps,
         label_end_times_ns,
@@ -180,8 +216,24 @@ def fit_walk_forward_model(
         oos_mse = 0.0
         oos_corr = 0.0
 
-    # Fit final causal deployment bundle on all data available at training cutoff
+    # Fit final causal deployment bundle on all data available at training cutoff;
+    # enforce trained_until_ns = max(label_end_times_ns) so pre-cutoff trading is rejected.
     mean_f, std_f, w_f, b_f = _fit_ridge(x_all, y_all, alpha)
+    trained_until_ns = max(int(t) for t in label_end_times_ns)
+    model_digest = hashlib.sha256(
+        json.dumps(
+            {
+                "model_id": model_id,
+                "market": resolved_market,
+                "symbol": resolved_symbol,
+                "feature_names": list(feature_names),
+                "weights": [float(v) for v in w_f],
+                "bias": float(b_f),
+                "trained_until_ns": trained_until_ns,
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()[:16]
     meta = ModelMetadata(
         model_id=model_id,
         kind="linear_ridge",
@@ -192,6 +244,12 @@ def fit_walk_forward_model(
         weights=tuple(float(v) for v in w_f),
         bias=float(b_f),
         alpha=alpha,
+        market=resolved_market,
+        symbol=resolved_symbol,
+        feature_version=feature_version,
+        input_digest=input_digest,
+        trained_until_ns=trained_until_ns,
+        model_digest=model_digest,
     )
     bundle = ModelBundle(meta)
     saved_dir = bundle.save(models_root)
@@ -201,4 +259,6 @@ def fit_walk_forward_model(
         oos_mse=oos_mse,
         oos_corr=oos_corr,
         bundle_dir=str(saved_dir),
+        trained_until_ns=trained_until_ns,
+        model_digest=model_digest,
     )

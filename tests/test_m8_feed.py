@@ -269,3 +269,92 @@ def test_recorder_vs_gateway_parity_report() -> None:
     assert len(report.field_mismatches) == 1
     assert report.field_mismatches[0].field == "best_bid_price"
     assert report.latency_p50_ms == pytest.approx(4.0)
+
+
+def test_usdm_and_spot_chunk_pruning_equiv_and_ref_proto_and_parity_guards(tmp_path: Path) -> None:
+    # Build Spot + USD-M (um_perpetual) chunks in one partition & compare pruned vs unpruned
+    part = tmp_path / "dual_market_part"
+    layout = ensure_storage_layout(part)
+    t0 = 1_800_000_000_000_000_000
+    with Catalog(layout.catalog) as catalog:
+        for raw_mkt, uid in (("spot", 42), ("um_perpetual", 42), ("um_perpetual", 43)):
+            writer = RawChunkWriter(
+                layout=layout,
+                catalog=catalog,
+                chunk_id=uuid4(),
+                market=raw_mkt,
+                symbol="BTCUSDT",
+                stream="book_ticker",
+                collector_instance_id="rec-dual",
+                collector_version="1.0.0",
+            )
+            payload = {"u": uid, "s": "BTCUSDT", "b": "99.99", "B": "10", "a": "100.00", "A": "5"}
+            writer.append(
+                EventEnvelope(
+                    market=raw_mkt,
+                    symbol="BTCUSDT",
+                    stream="book_ticker",
+                    module="book_ticker",
+                    connection_id="c1",
+                    collector_instance_id="rec-dual",
+                    collector_version="1.0.0",
+                    receive_time_utc_ns=t0 + uid,
+                    receive_monotonic_ns=100 + uid,
+                    source_sequence={"u": uid},
+                    raw_payload=json.dumps(payload).encode(),
+                )
+            )
+            writer.sync()
+            _seal_clean_writer(writer, layout=layout, catalog=catalog)
+
+    for mkt, expected_uids in ((Market.SPOT, [42]), (Market.USDM, [42, 43])):
+        unpruned = [
+            e.update_id
+            for e in RecorderReplayFeed.from_recorder_root(part, market_filter={mkt}).iter_events()
+            if isinstance(e, BookTickerEvent)
+        ]
+        pruned = [
+            e.update_id
+            for e in RecorderReplayFeed.from_recorder_root(
+                part,
+                market_filter={mkt},
+                symbol_filter={"BTCUSDT"},
+                stream_filter={Stream.BOOK_TICKER},
+                min_utc_ns=t0,
+                max_utc_ns=t0 + 100,
+            ).iter_events()
+            if isinstance(e, BookTickerEvent)
+        ]
+        assert unpruned == pruned == expected_uids
+
+    # Typed ReferenceObservation oneof INSTRUMENT decode (no payload_json / observe_time_utc_ns)
+    env_ref = gateway_messages_pb2.GatewayEventEnvelope()
+    ro = env_ref.reference_observation
+    ro.venue = enums_pb2.VENUE_BINANCE
+    ro.market = enums_pb2.MARKET_SPOT
+    ro.symbol = "BTCUSDT"
+    ro.source_kind = enums_pb2.REFERENCE_SOURCE_KIND_INSTRUMENT
+    ro.status = enums_pb2.REFERENCE_OBSERVATION_STATUS_VALID
+    ro.receive_time_utc_ns = t0
+    ro.instrument.symbol_present = True
+    ro.instrument.trading_status = "TRADING"
+    ro.instrument.base_asset = "BTC"
+    ro.instrument.quote_asset = "USDT"
+    flt = ro.instrument.filters.add()
+    flt.filter_type = "PRICE_FILTER"
+    flt.tick_size = "0.01"
+    live = GatewayLiveFeed(stub=_MockGatewayStub(_make_status(book_ticker_enabled=True), []))
+    decoded_ref = live.translate_event_envelope(env_ref)
+    assert isinstance(decoded_ref, ReferenceObservationEvent)
+    assert decoded_ref.source_kind == "instrument" and decoded_ref.status == "VALID"
+    assert decoded_ref.tick_size == Decimal("0.01") and decoded_ref.receive_time_utc_ns == t0
+
+    # Parity honest guards: empty, disjoint, explicit out-of-window, duplicate UID
+    e_a = BookTickerEvent("BINANCE", Market.SPOT, "BTCUSDT", Decimal("100"), Decimal("1"), Decimal("101"), Decimal("1"), update_id=1, receive_time_utc_ns=t0)
+    e_b = BookTickerEvent("BINANCE", Market.SPOT, "BTCUSDT", Decimal("100"), Decimal("1"), Decimal("101"), Decimal("1"), update_id=2, receive_time_utc_ns=t0 + 1_000_000)
+    disjoint = compare_overlapping_windows([e_a], [e_b])
+    assert disjoint.matched_count == 0 and disjoint.recorder_coverage is None and disjoint.status == "INSUFFICIENT"
+    outside = compare_overlapping_windows([e_a], [e_a], window_start_ns=t0 + 1_000_000, window_end_ns=t0 + 2_000_000)
+    assert outside.matched_count == 0 and outside.recorder_coverage is None and outside.status == "NO_DATA"
+    dup = compare_overlapping_windows([e_a, e_a], [e_a])
+    assert dup.recorder_duplicate_count == 1 and dup.status == "MISMATCH"

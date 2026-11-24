@@ -73,11 +73,24 @@ class QuantitativeMcpServer:
         if "events" in args:
             return [event_from_dict(d) for d in args["events"]]
         if "partition_root" in args:
-            feed = RecorderReplayFeed.from_recorder_root(Path(args["partition_root"]))
-            return list(feed.iter_events())
+            mkt_filter = {Market(m) for m in args["market_filter"]} if args.get("market_filter") else None
+            sym_filter = {str(s) for s in args["symbol_filter"]} if args.get("symbol_filter") else None
+            strm_filter = {str(s) for s in args["stream_filter"]} if args.get("stream_filter") else None
+            min_ns = int(args["min_utc_ns"]) if args.get("min_utc_ns") is not None else None
+            max_ns = int(args["max_utc_ns"]) if args.get("max_utc_ns") is not None else None
+            strict_ts = bool(args.get("strict_receive_time", False))
+            feed = RecorderReplayFeed.from_recorder_root(
+                Path(args["partition_root"]),
+                market_filter=mkt_filter,
+                symbol_filter=sym_filter,
+                stream_filter=strm_filter,
+                min_utc_ns=min_ns,
+                max_utc_ns=max_ns,
+            )
+            return list(feed.iter_events(strict_receive_time=strict_ts))
         if "raw_records" in args:
             feed = RecorderReplayFeed.from_raw_records(args["raw_records"])
-            return list(feed.iter_events())
+            return list(feed.iter_events(strict_receive_time=bool(args.get("strict_receive_time", False))))
         raise ValueError("Must provide 'events', 'partition_root', or 'raw_records'")
 
     def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -109,18 +122,37 @@ class QuantitativeMcpServer:
         if name == "train_model":
             events = self._load_events(args)
             rows = extract_feature_rows(events)
-            if len(rows) < 6:
-                raise ValueError("Need at least 6 feature rows to run Walk-Forward training")
             horizon = int(args.get("horizon_steps", 1))
+            if horizon <= 0:
+                raise ValueError("horizon_steps must be positive")
+            # Construct forward targets strictly per (market, symbol) & contiguous healthy epoch
+            epochs: dict[tuple[str, str], list[list[dict[str, Any]]]] = {}
+            for r in rows:
+                pkey = (str(r["market"]), str(r["symbol"]))
+                if not r.get("health_valid", True):
+                    epochs.setdefault(pkey, []).append([])
+                    continue
+                plist = epochs.setdefault(pkey, [[]])
+                if not plist:
+                    plist.append([])
+                plist[-1].append(r)
+
+            target_mkt = str(args.get("market", rows[0]["market"] if rows else "SPOT"))
+            target_sym = str(args.get("symbol", rows[0]["symbol"] if rows else "BTCUSDT"))
+            train_rows: list[dict[str, Any]] = []
             targets: list[float] = []
             end_times: list[int] = []
-            for idx in range(len(rows) - horizon):
-                p0 = rows[idx]["mid_price"]
-                p1 = rows[idx + horizon]["mid_price"]
-                ret_bps = ((p1 - p0) / p0) * 10_000.0 if p0 > 0 else 0.0
-                targets.append(ret_bps)
-                end_times.append(int(rows[idx + horizon]["timestamp_ns"]))
-            train_rows = rows[: len(targets)]
+            for seg in epochs.get((target_mkt, target_sym), []):
+                for idx in range(len(seg) - horizon):
+                    p0 = seg[idx]["mid_price"]
+                    p1 = seg[idx + horizon]["mid_price"]
+                    ret_bps = ((p1 - p0) / p0) * 10_000.0 if p0 > 0 else 0.0
+                    train_rows.append(seg[idx])
+                    targets.append(ret_bps)
+                    end_times.append(int(seg[idx + horizon]["timestamp_ns"]))
+
+            if len(train_rows) < 6:
+                raise ValueError("Need at least 6 contiguous healthy feature rows to run Walk-Forward training")
             bundle, report = fit_walk_forward_model(
                 train_rows,
                 targets,
@@ -130,10 +162,14 @@ class QuantitativeMcpServer:
                 feature_names=tuple(args.get("feature_names", DEFAULT_FEATURES)),
                 n_splits=int(args.get("n_splits", 3)),
                 embargo_ns=int(args.get("embargo_ns", 0)),
+                market=target_mkt,
+                symbol=target_sym,
             )
             return _cap_json_bytes({
                 "model_id": bundle.model_id,
                 "schema_hash": bundle.schema_hash,
+                "trained_until_ns": report.trained_until_ns,
+                "model_digest": report.model_digest,
                 "folds_evaluated": report.folds_evaluated,
                 "oos_mse": report.oos_mse,
                 "oos_corr": report.oos_corr,

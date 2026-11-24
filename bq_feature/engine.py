@@ -21,9 +21,11 @@ from bq_feed.events import (
 )
 
 
-def _event_ts_ns(ev: MarketEvent) -> int:
+def _event_ts_ns(ev: MarketEvent, *, strict_receive_time: bool = False) -> int | None:
     if ev.receive_time_utc_ns is not None:
         return ev.receive_time_utc_ns
+    if strict_receive_time:
+        return None
     exch = getattr(ev, "exchange_event_time_ms", None) or getattr(ev, "trade_time_ms", None) or getattr(ev, "order_trade_time_ms", None)
     return int(exch or 0) * 1_000_000
 
@@ -124,9 +126,12 @@ class FeatureEngine:
         *,
         volume_clock_threshold: float = 10.0,
         sweep_gap_ns: int = 50_000_000,
+        strict_receive_time: bool = False,
     ) -> None:
         self._vol_thresh = volume_clock_threshold
         self._sweep_gap_ns = sweep_gap_ns
+        self._strict_receive_time = strict_receive_time
+        self.skipped_missing_receive_time_count = 0
 
     def on_health(self, state: FeatureState, health: StreamHealthEvent) -> None:
         st = state.get(health.market, health.symbol)
@@ -225,8 +230,11 @@ class FeatureEngine:
 
     def update(self, state: FeatureState, event: MarketEvent) -> FeatureVector | None:
         """Pure causal state transition driven exclusively by delivered event + current state."""
+        ts_ns = _event_ts_ns(event, strict_receive_time=self._strict_receive_time)
+        if ts_ns is None:
+            self.skipped_missing_receive_time_count += 1
+            return None
         state.last_seq = max(state.last_seq, event.delivery_seq)
-        ts_ns = _event_ts_ns(event)
         st = state.get(event.market, event.symbol)
 
         if isinstance(event, BookTickerEvent):
