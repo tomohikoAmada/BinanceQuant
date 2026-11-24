@@ -361,7 +361,8 @@ class BinanceSpotRestClient:
         fee_asset = "USDT"
         side = str(data.get("side", "BUY"))
         sym = str(data.get("symbol", "BTCUSDT"))
-        cid = str(data.get("clientOrderId", fallback_cid))
+        # DELETE /api/v3/order sets clientOrderId to a fresh cancel-request ID and stores the original in origClientOrderId.
+        cid = str(data.get("origClientOrderId") or data.get("clientOrderId") or fallback_cid)
         if isinstance(fills_raw, list):
             for idx, f in enumerate(fills_raw):
                 if not isinstance(f, dict):

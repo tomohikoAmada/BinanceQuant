@@ -306,3 +306,22 @@ def test_decimal_formatting_and_drop_ack_wrapper(tmp_path: Path) -> None:
     assert rec is not None and rec.state == OrderState.FILLED
     assert wrapper.query_account()["BTC"] == Decimal("0.01")
     ledger.close()
+
+
+def test_binance_cancel_payload_prefers_orig_client_order_id() -> None:
+    snap = BinanceSpotRestClient._parse_order_payload(
+        {
+            "symbol": "BTCUSDT",
+            "orderId": 999,
+            "origClientOrderId": "bq-m11-orig-1",
+            "clientOrderId": "HFOV7kr78N0AQUawyxsugt",
+            "status": "CANCELED",
+            "side": "BUY",
+            "origQty": "0.00100",
+            "executedQty": "0.00000",
+            "cummulativeQuoteQty": "0.00000",
+        },
+        "bq-m11-orig-1",
+    )
+    assert snap.client_order_id == "bq-m11-orig-1"
+    assert snap.status == "CANCELED"
