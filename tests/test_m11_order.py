@@ -325,3 +325,18 @@ def test_binance_cancel_payload_prefers_orig_client_order_id() -> None:
     )
     assert snap.client_order_id == "bq-m11-orig-1"
     assert snap.status == "CANCELED"
+
+
+def test_client_order_id_sanitization_matches_binance_regex() -> None:
+    import re
+    from bq_order.guard import sanitize_client_order_id
+
+    pat = re.compile(r"^[a-zA-Z0-9-_]{1,36}$")
+    c1 = sanitize_client_order_id("btc_spot_bbo_rule.v1-1-B")
+    c2 = sanitize_client_order_id("btc_spot_bbo_rule-v1-1-B")
+    c3 = sanitize_client_order_id("very.long.strategy.name.with.dots." + "x" * 50)
+    assert pat.fullmatch(c1)
+    assert pat.fullmatch(c2)
+    assert pat.fullmatch(c3)
+    assert c1 != c2
+    assert sanitize_client_order_id("bq-m11-plain_1") == "bq-m11-plain_1"

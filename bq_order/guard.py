@@ -3,8 +3,22 @@
 from __future__ import annotations
 
 from decimal import Decimal
+import hashlib
+import re
 import time
 from typing import Literal
+
+_VALID_CID_RE = re.compile(r"^[a-zA-Z0-9-_]{1,36}$")
+
+
+def sanitize_client_order_id(intent_id: str) -> str:
+    """Map an arbitrary intent_id deterministically into Binance's ^[a-zA-Z0-9-_]{1,36}$ rule."""
+    if _VALID_CID_RE.fullmatch(intent_id):
+        return intent_id
+    cleaned = re.sub(r"[^a-zA-Z0-9-_]", "-", intent_id)
+    digest = hashlib.sha256(intent_id.encode("utf-8")).hexdigest()[:10]
+    prefix = cleaned[:25].rstrip("-_") or "bq"
+    return f"{prefix}-{digest}"
 
 from bq_backtest.strategy import OrderIntent
 
@@ -72,9 +86,10 @@ class OrderExecutionGuard:
         wire_order_type: Literal["MARKET", "LIMIT"] = "LIMIT" if intent.order_type == "LIMIT" else "MARKET"
 
         # 2. Persist pre-wire send intent atomically in SQLite WAL; NEVER re-send duplicate cid
+        cid = sanitize_client_order_id(intent.intent_id)
         created_new, rec = self._ledger.reserve_before_send(
             intent_id=intent.intent_id,
-            client_order_id=intent.intent_id,
+            client_order_id=cid,
             market=intent.market.value,
             symbol=intent.symbol,
             side="BUY" if intent.side == "BUY" else "SELL",
