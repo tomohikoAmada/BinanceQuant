@@ -8,4 +8,5 @@ Downstream single repository (per Team C D1) consuming `BinanceMarketDataContrac
 - `bq_model`: Purged + Embargoed Walk-Forward trainer and `<1ms` inference bundles (`models/<model_id>/`).
 - `bq_backtest`: 3-stage `Regime -> Alpha -> MetaCostRisk` + deterministic `btc_spot_bbo_rule`, F1/F2 fill simulators, exchange filters, real `fundingTime` settlement, causality perturbation verification, sensitivity matrix, and immutable `runs/<run_id>/`.
 - `bq_mcp`: Local stdio MCP server (6 tools, `<64 KiB` responses, AST + causality + parity guard).
-- `bq_signal`: Paper/live signal runner (`deploy.toml`) + two-stage `reconcile_paper` (exact journal replay + independent Recorder UID cross-reconciliation).
+- `bq_signal`: Paper/live signal runner (`deploy.toml`, bounded-memory 72h daemon with `--duration-seconds` / `--reconnect`, `--order-socket` IPC sink) + streaming two-stage `reconcile` (Stage 1 exact replay + windowed Stage 2 independent Recorder UID cross-reconciliation).
+- `bq_order`: M11 credential-isolated execution guard (`BQOrder`) with single-writer SQLite WAL pre-wire ledger, dropped-ACK/timeout crash recovery, persistent 3-timestamp Kill Switch, hard pre-trade risk limits, UDS local IPC server (`bq-order serve`), deterministic `FakeSpotExchange` fault-injection harness, and `BinanceSpotRestClient` (Spot Testnet default).

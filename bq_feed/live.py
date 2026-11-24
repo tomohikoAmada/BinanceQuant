@@ -521,6 +521,7 @@ class GatewayLiveFeed:
         request_id: str = "bq-live-ev",
         preflight: bool = True,
         max_items: int | None = None,
+        stop_event: threading.Event | None = None,
     ) -> Iterator[FeedEvent]:
         if preflight:
             self.preflight_capabilities([(market, symbol, stream)])
@@ -559,6 +560,9 @@ class GatewayLiveFeed:
                 t.start()
                 poll_s = min(0.5, max(0.05, self._stale_threshold_ns / 2_000_000_000.0))
                 while True:
+                    if stop_event is not None and stop_event.is_set():
+                        stop_ev.set()
+                        break
                     try:
                         kind, payload = q.get(timeout=poll_s)
                     except queue.Empty:

@@ -27,7 +27,7 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["bq_feed*", "bq_feature*", "bq_model*", "bq_backtest*", "bq_mcp*", "bq_signal*"]
+include = ["bq_feed*", "bq_feature*", "bq_model*", "bq_backtest*", "bq_mcp*", "bq_signal*", "bq_order*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

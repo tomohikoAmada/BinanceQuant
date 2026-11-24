@@ -150,6 +150,7 @@ class SignalRunner:
             intent_sink=intent_sink,
             enforce_model_cutoff=True,
             strict_receive_time=config.strict_receive_time,
+            retain_history=False,
         )
 
     def _restore_prior_journal(self, path: Path) -> None:
@@ -207,7 +208,7 @@ class SignalRunner:
             mode=self._mode,
             run_id=self._run_id,
             processed_events=self._processed_this_run,
-            intents_emitted=len(self._core.intents),
+            intents_emitted=self._core.intents_count,
             fills_count=self._core.fills_count,
             blocked_by_health_count=self._core.blocked_count,
             pending_at_end_count=len(self._core.pending),
@@ -216,46 +217,48 @@ class SignalRunner:
             journal_path=str(out_path) if out_path else None,
         )
 
-    def _process_one(self, ev: FeedEvent, jf: Any | None) -> None:
+    def _build_entry(self, ev: FeedEvent) -> PaperJournalEntry:
         self._journal_seq += 1
         self._processed_this_run += 1
         outcome = self._core.step(ev)
+        settled_payload = [
+            _serialize_settled_fill(intent, fill, entry)
+            for intent, fill, entry in outcome.settled_fills
+        ]
+        primary_fill = settled_payload[0] if settled_payload else None
+        intent_obj = outcome.emitted_intent
+        return PaperJournalEntry(
+            journal_seq=self._journal_seq,
+            run_id=self._run_id,
+            config_hash=self._cfg.config_hash,
+            strategy_id=self._strategy.strategy_id,
+            model_id=self._cfg.model_id,
+            schema_hash=self._schema_hash,
+            model_digest=self._model_digest,
+            mode=self._mode,
+            health_ok=outcome.health_ok,
+            blocked_reason=outcome.blocked_reason,
+            event=event_to_dict(ev),
+            intent={
+                "intent_id": intent_obj.intent_id,
+                "side": intent_obj.side,
+                "quantity": str(intent_obj.quantity),
+                "decision_seq": intent_obj.decision_seq,
+                "decision_ts_ns": intent_obj.decision_ts_ns,
+                "decision_infer_ns": intent_obj.decision_infer_ns,
+                "reason": intent_obj.reason,
+            }
+            if intent_obj
+            else None,
+            fill=primary_fill,
+            settled_fills=settled_payload,
+            cash_after=str(outcome.cash_after),
+            position_after=str(outcome.position_after),
+            pending_count=len(self._core.pending),
+        )
 
+    def _process_one(self, ev: FeedEvent, jf: Any | None) -> None:
+        entry = self._build_entry(ev)
         if jf is not None:
-            settled_payload = [
-                _serialize_settled_fill(intent, fill, entry)
-                for intent, fill, entry in outcome.settled_fills
-            ]
-            primary_fill = settled_payload[0] if settled_payload else None
-            intent_obj = outcome.emitted_intent
-            entry = PaperJournalEntry(
-                journal_seq=self._journal_seq,
-                run_id=self._run_id,
-                config_hash=self._cfg.config_hash,
-                strategy_id=self._strategy.strategy_id,
-                model_id=self._cfg.model_id,
-                schema_hash=self._schema_hash,
-                model_digest=self._model_digest,
-                mode=self._mode,
-                health_ok=outcome.health_ok,
-                blocked_reason=outcome.blocked_reason,
-                event=event_to_dict(ev),
-                intent={
-                    "intent_id": intent_obj.intent_id,
-                    "side": intent_obj.side,
-                    "quantity": str(intent_obj.quantity),
-                    "decision_seq": intent_obj.decision_seq,
-                    "decision_ts_ns": intent_obj.decision_ts_ns,
-                    "decision_infer_ns": intent_obj.decision_infer_ns,
-                    "reason": intent_obj.reason,
-                }
-                if intent_obj
-                else None,
-                fill=primary_fill,
-                settled_fills=settled_payload,
-                cash_after=str(outcome.cash_after),
-                position_after=str(outcome.position_after),
-                pending_count=len(self._core.pending),
-            )
             jf.write(json.dumps(asdict(entry), sort_keys=True, separators=(",", ":")) + "\n")
             jf.flush()

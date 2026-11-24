@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 import json
 from pathlib import Path
-from tempfile import TemporaryDirectory
 
-from bq_feed.events import FeedEvent, StreamHealthEvent, event_from_dict
+from bq_feed.events import FeedEvent, Market, StreamHealthEvent, event_from_dict
 from bq_feed.parity import ParityReport, compare_overlapping_windows
 from bq_feed.replay import RecorderReplayFeed
 
@@ -35,85 +34,91 @@ def reconcile_paper_journal(
     window_start_ns: int | None = None,
     window_end_ns: int | None = None,
 ) -> ReconcileReport:
-    """Execute Stage 1 exact journal replay & Stage 2 independent Recorder UID cross-reconciliation."""
-    raw_lines = [
-        json.loads(line)
-        for line in journal_path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
+    """Execute Stage 1 streaming exact journal replay & Stage 2 independent Recorder UID cross-reconciliation."""
     mismatches: list[str] = []
-    if not raw_lines:
-        mismatches.append("empty_journal: 0 entries")
-        recorded_events: list[FeedEvent] = []
-    else:
-        recorded_events = [event_from_dict(row["event"]) for row in raw_lines]
+    entries_checked = 0
+    runner = SignalRunner(config, mode="paper")
+    need_stage2 = recorder_root is not None or recorder_events is not None
+    recorded_events: list[FeedEvent] = []
+    seen_markets: set[Market] = set()
+    seen_symbols: set[str] = set()
+    min_recv_ns: int | None = None
+    max_recv_ns: int | None = None
+    paper_gaps = 0
+    seq_broken = False
 
-        # Validate contiguous monotonic sequence numbers before replay
-        for expected_seq, row in enumerate(raw_lines, start=1):
-            if int(row.get("journal_seq", -1)) != expected_seq:
+    with journal_path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            if not line.strip():
+                continue
+            orig = json.loads(line)
+            entries_checked += 1
+            ev = event_from_dict(orig["event"])
+
+            if not seq_broken and int(orig.get("journal_seq", -1)) != entries_checked:
                 mismatches.append(
-                    f"sequence discontinuity at index {expected_seq}: got journal_seq={row.get('journal_seq')}"
+                    f"sequence discontinuity at index {entries_checked}: got journal_seq={orig.get('journal_seq')}"
                 )
-                break
+                seq_broken = True
 
-        with TemporaryDirectory() as tmpdir:
-            replay_journal = Path(tmpdir) / "replay.jsonl"
-            runner = SignalRunner(config, mode="paper")
-            runner.run_events(recorded_events, journal_path=replay_journal)
-            replay_lines = [
-                json.loads(line)
-                for line in replay_journal.read_text(encoding="utf-8").splitlines()
-                if line.strip()
-            ]
+            rep = asdict(runner._build_entry(ev))
+            seq = orig.get("journal_seq")
+            if orig.get("config_hash") != config.config_hash:
+                mismatches.append(f"seq {seq}: config_hash mismatch")
+            elif orig.get("strategy_id") != rep.get("strategy_id"):
+                mismatches.append(f"seq {seq}: strategy_id mismatch")
+            elif orig.get("mode") != rep.get("mode"):
+                mismatches.append(f"seq {seq}: mode mismatch")
+            elif bool(orig.get("health_ok", True)) != bool(rep.get("health_ok", True)):
+                mismatches.append(f"seq {seq}: health_ok mismatch")
+            elif orig.get("blocked_reason") != rep.get("blocked_reason"):
+                mismatches.append(f"seq {seq}: blocked_reason mismatch")
+            elif orig.get("intent") != rep.get("intent"):
+                mismatches.append(f"seq {seq}: intent mismatch {orig.get('intent')} != {rep.get('intent')}")
+            elif "settled_fills" in orig and orig["settled_fills"] != rep["settled_fills"]:
+                mismatches.append(f"seq {seq}: settled_fills mismatch")
+            elif "settled_fills" not in orig and orig.get("fill") != rep.get("fill"):
+                mismatches.append(f"seq {seq}: fill mismatch {orig.get('fill')} != {rep.get('fill')}")
+            elif orig.get("cash_after") != rep.get("cash_after") or orig.get("position_after") != rep.get("position_after"):
+                mismatches.append(f"seq {seq}: ledger mismatch")
 
-        if len(replay_lines) != len(raw_lines):
-            mismatches.append(
-                f"entry count mismatch: orig={len(raw_lines)} vs replay={len(replay_lines)}"
-            )
-        else:
-            for orig, rep in zip(raw_lines, replay_lines):
-                seq = orig["journal_seq"]
-                if orig.get("config_hash") != config.config_hash:
-                    mismatches.append(f"seq {seq}: config_hash mismatch")
-                    break
-                if orig.get("strategy_id") != rep.get("strategy_id"):
-                    mismatches.append(f"seq {seq}: strategy_id mismatch")
-                if orig.get("mode") != rep.get("mode"):
-                    mismatches.append(f"seq {seq}: mode mismatch")
-                if bool(orig.get("health_ok", True)) != bool(rep.get("health_ok", True)):
-                    mismatches.append(f"seq {seq}: health_ok mismatch")
-                if orig.get("blocked_reason") != rep.get("blocked_reason"):
-                    mismatches.append(f"seq {seq}: blocked_reason mismatch")
-                if orig.get("intent") != rep.get("intent"):
-                    mismatches.append(
-                        f"seq {seq}: intent mismatch {orig.get('intent')} != {rep.get('intent')}"
-                    )
-                if "settled_fills" in orig and "settled_fills" in rep:
-                    if orig["settled_fills"] != rep["settled_fills"]:
-                        mismatches.append(f"seq {seq}: settled_fills mismatch")
-                elif orig.get("fill") != rep.get("fill"):
-                    mismatches.append(
-                        f"seq {seq}: fill mismatch {orig.get('fill')} != {rep.get('fill')}"
-                    )
-                if orig.get("cash_after") != rep.get("cash_after") or orig.get("position_after") != rep.get("position_after"):
-                    mismatches.append(f"seq {seq}: ledger mismatch")
+            if need_stage2:
+                if isinstance(ev, StreamHealthEvent):
+                    ev_ts = ev.observed_time_utc_ns
+                else:
+                    ev_ts = ev.receive_time_utc_ns
+                    seen_markets.add(ev.market)
+                    seen_symbols.add(ev.symbol)
+                    if ev_ts is not None:
+                        min_recv_ns = ev_ts if min_recv_ns is None else min(min_recv_ns, ev_ts)
+                        max_recv_ns = ev_ts if max_recv_ns is None else max(max_recv_ns, ev_ts)
+                in_win = True
+                if ev_ts is not None:
+                    if window_start_ns is not None and ev_ts < window_start_ns:
+                        in_win = False
+                    if window_end_ns is not None and ev_ts > window_end_ns:
+                        in_win = False
+                if in_win:
+                    recorded_events.append(ev)
+                    if isinstance(ev, StreamHealthEvent) and ev.status in ("GAP", "STALE"):
+                        paper_gaps += 1
 
-    stage1_ok = bool(raw_lines) and len(mismatches) == 0
+    if entries_checked == 0:
+        mismatches.append("empty_journal: 0 entries")
+
+    stage1_ok = entries_checked > 0 and len(mismatches) == 0
 
     # Stage 2: Independent Recorder cross-reconciliation
     parity: ParityReport | None = None
     gap_attr: dict[str, int] = {}
     if recorder_root is not None:
-        ts_vals = [
-            ev.receive_time_utc_ns
-            for ev in recorded_events
-            if not isinstance(ev, StreamHealthEvent) and ev.receive_time_utc_ns is not None
-        ]
         pad_ns = 10_000_000_000  # +/-10s clock/chunk overlap pad
-        min_ns = ((window_start_ns if window_start_ns is not None else min(ts_vals)) - pad_ns) if (ts_vals or window_start_ns is not None) else None
-        max_ns = ((window_end_ns if window_end_ns is not None else max(ts_vals)) + pad_ns) if (ts_vals or window_end_ns is not None) else None
-        mkt_filter = {ev.market for ev in recorded_events if not isinstance(ev, StreamHealthEvent)} or {config.market}
-        sym_filter = {ev.symbol for ev in recorded_events if not isinstance(ev, StreamHealthEvent)} or {config.symbol}
+        eff_min = window_start_ns if window_start_ns is not None else min_recv_ns
+        eff_max = window_end_ns if window_end_ns is not None else max_recv_ns
+        min_ns = (eff_min - pad_ns) if eff_min is not None else None
+        max_ns = (eff_max + pad_ns) if eff_max is not None else None
+        mkt_filter = seen_markets or {config.market}
+        sym_filter = seen_symbols or {config.symbol}
         rec_stream = list(
             RecorderReplayFeed.from_recorder_root(
                 recorder_root,
@@ -136,9 +141,6 @@ def reconcile_paper_journal(
             window_start_ns=window_start_ns,
             window_end_ns=window_end_ns,
         )
-        paper_gaps = sum(
-            1 for e in recorded_events if isinstance(e, StreamHealthEvent) and e.status in ("GAP", "STALE")
-        )
         gap_attr = {
             "paper_health_gaps": paper_gaps,
             "recorder_health_gaps": parity.recorder_gaps,
@@ -149,7 +151,7 @@ def reconcile_paper_journal(
     accepted = stage1_ok and (parity is None or parity.status == "PASSED")
     return ReconcileReport(
         stage1_exact_replay_passed=stage1_ok,
-        stage1_entries_checked=len(raw_lines),
+        stage1_entries_checked=entries_checked,
         stage1_mismatches=mismatches,
         stage2_parity=parity,
         gap_attribution=gap_attr,

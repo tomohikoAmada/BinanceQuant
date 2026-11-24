@@ -119,6 +119,7 @@ class CausalTradingCore:
         intent_sink: Callable[[OrderIntent], None] | None = None,
         enforce_model_cutoff: bool = True,
         strict_receive_time: bool = False,
+        retain_history: bool = True,
         feature_engine: FeatureEngine | None = None,
     ) -> None:
         self.strategy = strategy
@@ -136,6 +137,7 @@ class CausalTradingCore:
         self.intent_sink = intent_sink
         self.enforce_model_cutoff = enforce_model_cutoff
         self.strict_receive_time = strict_receive_time
+        self.retain_history = retain_history
         self.default_filters = default_filters or ExchangeFilters()
 
         self.infer_ns_cfg = int(model_infer_ms * 1_000_000) if model_infer_ms is not None else None
@@ -162,6 +164,7 @@ class CausalTradingCore:
 
         self.pending: list[_PendingOrder] = []
         self._enqueue_seq = 0
+        self.intents_count = 0
         self.intents: list[OrderIntent] = []
         self.ledger: list[LedgerEntry] = []
         self.feat_hist: list[FeatureVector] = []
@@ -253,7 +256,8 @@ class CausalTradingCore:
             position_after=str(self.pos),
             realized_equity=str(eq),
         )
-        self.ledger.append(entry)
+        if self.retain_history:
+            self.ledger.append(entry)
         return (intent, res, entry)
 
     def _process_pending(self, up_to_ns: int) -> list[tuple[OrderIntent, FillResult, LedgerEntry]]:
@@ -315,7 +319,8 @@ class CausalTradingCore:
                 position_after=str(self.pos),
                 realized_equity=str(eq),
             )
-            self.ledger.append(entry)
+            if self.retain_history:
+                self.ledger.append(entry)
             settled.append((p.intent, res, entry))
         self.pending = still_waiting
         return settled
@@ -466,7 +471,8 @@ class CausalTradingCore:
         emitted_intent: OrderIntent | None = None
 
         if vec is not None:
-            self.feat_hist.append(vec)
+            if self.retain_history:
+                self.feat_hist.append(vec)
             if not hv or not vec.health_valid:
                 blocked_reason = self.health_reason_by_key.get(key, "FEATURE_HEALTH_INVALID") if not hv else "FEATURE_HEALTH_INVALID"
                 self.blocked_count += 1
@@ -475,7 +481,7 @@ class CausalTradingCore:
                     position_qty=self.pos,
                     cash_quote=max(Decimal(0), self.cash - self.reserved_cash_quote),
                     last_trade_ts_ns=self.last_trade_ts,
-                    intent_counter=len(self.intents),
+                    intent_counter=self.intents_count,
                     reserved_cash_quote=self.reserved_cash_quote,
                     reserved_buy_qty=self.reserved_buy_qty,
                     reserved_sell_qty=self.reserved_sell_qty,
@@ -483,7 +489,9 @@ class CausalTradingCore:
                 emitted_intent = self.strategy.on_feature(vec, acct)
 
         if emitted_intent is not None:
-            self.intents.append(emitted_intent)
+            self.intents_count += 1
+            if self.retain_history:
+                self.intents.append(emitted_intent)
             infer_ns = self.infer_ns_cfg if self.infer_ns_cfg is not None else max(0, int(emitted_intent.decision_infer_ns))
             send_ns = emitted_intent.decision_ts_ns + infer_ns
             arrival_ns = send_ns + self.rtt_ns_cfg
