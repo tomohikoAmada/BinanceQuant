@@ -55,6 +55,8 @@ class BookTickerEvent:
     update_id: int | None = None
     exchange_event_time_ms: int | None = None
     exchange_transaction_time_ms: int | None = None
+    exchange_event_time_ns: int | None = None
+    exchange_transaction_time_ns: int | None = None
     receive_time_utc_ns: int | None = None
     receive_monotonic_ns: int | None = None
     source: str = "unknown"
@@ -77,6 +79,7 @@ class AggTradeEvent:
     buyer_is_maker: bool
     normal_quantity: Decimal | None = None
     exchange_event_time_ms: int | None = None
+    trade_time_ns: int | None = None
     receive_time_utc_ns: int | None = None
     receive_monotonic_ns: int | None = None
     source: str = "unknown"

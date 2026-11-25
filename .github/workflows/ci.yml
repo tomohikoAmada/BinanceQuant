@@ -25,3 +25,21 @@ jobs:
           python -m pip install -e ".[dev]" /tmp/contracts /tmp/recorder/vendor/python-baseline
       - name: Run pytest
         run: pytest -v
+
+  nautilus-tests:
+    name: Nautilus M-NT1 tests (Ubuntu 3.13 uv locked)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Checkout Contracts Python baseline
+        run: |
+          git clone --depth 1 https://github.com/tomohikoAmada/BinanceMarketDataContracts.git /tmp/contracts
+      - name: Install locked Python 3.13 environment
+        run: |
+          uv python install 3.13
+          uv venv --python 3.13 .venv-nautilus
+          uv pip install --python .venv-nautilus/bin/python --require-hashes -r locks/nautilus-py313.lock
+          uv pip install --python .venv-nautilus/bin/python --no-deps -e /tmp/contracts -e .
+      - name: Run Nautilus pytest
+        run: .venv-nautilus/bin/python -m pytest -v tests/test_mnt1_nautilus.py

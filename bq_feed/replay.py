@@ -366,11 +366,48 @@ def _parse_rest_payload(
     return None
 
 
+def parse_strict_bool(value: Any) -> bool:
+    """Parse boolean strictly without Python's bool('False') == True pitfall."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and not isinstance(value, bool):
+        if value in (0, 1):
+            return bool(value)
+        raise ValueError(f"Invalid integer boolean value: {value!r}")
+    if isinstance(value, str):
+        norm = value.strip().lower()
+        if norm in ("true", "1", "t", "yes"):
+            return True
+        if norm in ("false", "0", "f", "no"):
+            return False
+    raise ValueError(f"Invalid boolean value: {value!r}")
+
+
+def normalize_vision_epoch(raw_value: Any) -> tuple[int, int, str]:
+    """Normalize Binance Vision epoch timestamp (ms / us / ns) -> (ms, ns, unit)."""
+    val = int(raw_value)
+    abs_v = abs(val)
+    if abs_v >= 100_000_000_000_000_000:  # >= 1e17 -> nanoseconds
+        return val // 1_000_000, val, "ns"
+    if abs_v >= 100_000_000_000_000:  # >= 1e14 -> microseconds (Spot 2025-01-01+)
+        return val // 1_000, val * 1_000, "us"
+    return val, val * 1_000_000, "ms"
+
+
 def parse_vision_book_ticker(row: dict[str, Any], *, symbol: str, market: Market = Market.SPOT) -> BookTickerEvent:
     """Decode Binance Vision bookTicker CSV/dict row WITHOUT fabricating receive_time_utc_ns."""
     # Vision downloads only contain exchange event/transaction timestamps (for futures) or
     # update_id/best bid-ask; local receive_time_utc_ns NEVER existed and stays None.
-    exch_time = _opt_int(row.get("event_time") or row.get("transaction_time") or row.get("time"))
+    raw_event = row.get("event_time") or row.get("transaction_time") or row.get("time")
+    raw_tx = row.get("transaction_time") or row.get("T")
+    exch_time_ms: int | None = None
+    exch_time_ns: int | None = None
+    if raw_event is not None and raw_event != "":
+        exch_time_ms, exch_time_ns, _ = normalize_vision_epoch(raw_event)
+    tx_time_ms: int | None = None
+    tx_time_ns: int | None = None
+    if raw_tx is not None and raw_tx != "":
+        tx_time_ms, tx_time_ns, _ = normalize_vision_epoch(raw_tx)
     return BookTickerEvent(
         venue="BINANCE",
         market=market,
@@ -380,8 +417,10 @@ def parse_vision_book_ticker(row: dict[str, Any], *, symbol: str, market: Market
         best_bid_quantity=to_decimal(row.get("best_bid_qty") or row["B"]),
         best_ask_price=to_decimal(row.get("best_ask_price") or row["a"]),
         best_ask_quantity=to_decimal(row.get("best_ask_qty") or row["A"]),
-        exchange_event_time_ms=exch_time,
-        exchange_transaction_time_ms=_opt_int(row.get("transaction_time") or row.get("T")),
+        exchange_event_time_ms=exch_time_ms,
+        exchange_transaction_time_ms=tx_time_ms,
+        exchange_event_time_ns=exch_time_ns,
+        exchange_transaction_time_ns=tx_time_ns,
         receive_time_utc_ns=None,
         receive_monotonic_ns=None,
         source="binance_vision",
@@ -390,6 +429,9 @@ def parse_vision_book_ticker(row: dict[str, Any], *, symbol: str, market: Market
 
 def parse_vision_agg_trade(row: dict[str, Any], *, symbol: str, market: Market = Market.SPOT) -> AggTradeEvent:
     """Decode Binance Vision aggTrade row WITHOUT fabricating receive_time_utc_ns."""
+    raw_t = row.get("transact_time") if "transact_time" in row else row["T"]
+    trade_ms, trade_ns, _ = normalize_vision_epoch(raw_t)
+    raw_maker = row["is_buyer_maker"] if "is_buyer_maker" in row else row["m"]
     return AggTradeEvent(
         venue="BINANCE",
         market=market,
@@ -399,8 +441,9 @@ def parse_vision_agg_trade(row: dict[str, Any], *, symbol: str, market: Market =
         quantity=to_decimal(row.get("quantity") or row["q"]),
         first_trade_id=int(row.get("first_trade_id") or row["f"]),
         last_trade_id=int(row.get("last_trade_id") or row["l"]),
-        trade_time_ms=int(row.get("transact_time") or row["T"]),
-        buyer_is_maker=bool(row.get("is_buyer_maker") if "is_buyer_maker" in row else row["m"]),
+        trade_time_ms=trade_ms,
+        trade_time_ns=trade_ns,
+        buyer_is_maker=parse_strict_bool(raw_maker),
         receive_time_utc_ns=None,
         receive_monotonic_ns=None,
         source="binance_vision",

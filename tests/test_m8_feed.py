@@ -358,3 +358,42 @@ def test_usdm_and_spot_chunk_pruning_equiv_and_ref_proto_and_parity_guards(tmp_p
     assert outside.matched_count == 0 and outside.recorder_coverage is None and outside.status == "NO_DATA"
     dup = compare_overlapping_windows([e_a, e_a], [e_a])
     assert dup.recorder_duplicate_count == 1 and dup.status == "MISMATCH"
+
+
+def test_vision_spot_microseconds_and_strict_bool_parsing() -> None:
+    # 2025-01-01+ Spot Vision aggTrades use 16-digit microseconds and CSV "False" strings.
+    tr_false = parse_vision_agg_trade(
+        {
+            "agg_trade_id": "101",
+            "price": "95000.10",
+            "quantity": "0.00200",
+            "first_trade_id": "1",
+            "last_trade_id": "1",
+            "transact_time": "1735689600010866",
+            "is_buyer_maker": "False",
+        },
+        symbol="BTCUSDT",
+        market=Market.SPOT,
+    )
+    assert tr_false.buyer_is_maker is False
+    assert tr_false.trade_time_ms == 1735689600010
+    assert tr_false.trade_time_ns == 1735689600010866000
+    assert tr_false.receive_time_utc_ns is None
+
+    tr_true = parse_vision_agg_trade(
+        {
+            "agg_trade_id": "102",
+            "price": "95000.00",
+            "quantity": "0.00100",
+            "first_trade_id": "2",
+            "last_trade_id": "2",
+            "transact_time": "1735689600010",
+            "is_buyer_maker": "True",
+        },
+        symbol="BTCUSDT",
+        market=Market.USDM,
+    )
+    assert tr_true.buyer_is_maker is True
+    assert tr_true.trade_time_ms == 1735689600010
+    assert tr_true.trade_time_ns == 1735689600010000000
+    assert tr_true.receive_time_utc_ns is None

@@ -24,10 +24,14 @@ dependencies = [
 dev = [
     "pytest>=8.0",
 ]
+nautilus = [
+    "nautilus-trader==2.0.0rc9",
+    "pytest-asyncio>=0.24",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["bq_feed*", "bq_feature*", "bq_model*", "bq_backtest*", "bq_mcp*", "bq_signal*", "bq_order*"]
+include = ["bq_feed*", "bq_feature*", "bq_model*", "bq_backtest*", "bq_mcp*", "bq_signal*", "bq_order*", "bq_nautilus*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

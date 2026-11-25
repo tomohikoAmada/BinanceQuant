@@ -1,0 +1,28 @@
+{
+  "package": "nautilus-trader",
+  "version": "2.0.0rc9",
+  "python_requires": ">=3.13,<3.16",
+  "license": "LGPL-3.0-only",
+  "upstream_repo": "https://github.com/nautechsystems/nautilus_trader",
+  "fork_repo": "https://github.com/tomohikoAmada/nautilus_trader",
+  "tag": "v2.0.0rc9",
+  "commit": "da6b57aefdd62b44f675e434ffcfefca7f4025dd",
+  "wheels_cp313": {
+    "macosx_11_0_arm64": {
+      "filename": "nautilus_trader-2.0.0rc9-cp313-cp313-macosx_11_0_arm64.whl",
+      "sha256": "d78b65db7f92ece16144d9936dc4551b61d16034d1662b8572b2f9e40643502a"
+    },
+    "manylinux_2_34_x86_64": {
+      "filename": "nautilus_trader-2.0.0rc9-cp313-cp313-manylinux_2_34_x86_64.whl",
+      "sha256": "3adcf277e693657e9a7586b0b21590f29eeeebc46897b3b289afafab63654c8d"
+    },
+    "manylinux_2_34_aarch64": {
+      "filename": "nautilus_trader-2.0.0rc9-cp313-cp313-manylinux_2_34_aarch64.whl",
+      "sha256": "6a2ef16cb975336d1133bb06061edee735b4ced1d7819e375b723ca314779b87"
+    },
+    "win_amd64": {
+      "filename": "nautilus_trader-2.0.0rc9-cp313-cp313-win_amd64.whl",
+      "sha256": "f921e8b7bdd5613207b0021c84f234d47d597b385e21fbd4ec8f6d3bb2135f9d"
+    }
+  }
+}
