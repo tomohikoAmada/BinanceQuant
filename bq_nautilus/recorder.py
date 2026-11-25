@@ -20,11 +20,22 @@ import zstandard
 from bq_feed.events import (
     AggTradeEvent,
     BookTickerEvent,
+    DepthUpdateEvent,
     FeedEvent,
+    LiquidationEvent,
     Market,
+    MarkPriceEvent,
+    OrderBookSnapshotEvent,
     ReferenceObservationEvent,
     Stream,
     StreamHealthEvent,
+)
+from .custom_data import (
+    BMD_LIQUIDATION_DATATYPE,
+    BMD_REFERENCE_DATATYPE,
+    BmdLiquidationData,
+    BmdReferenceData,
+    wrap_custom_data,
 )
 from bq_feed.replay import (
     _MARKET_ALIASES,
@@ -606,18 +617,301 @@ def bmd_health_to_instrument_status(
     )
 
 
+class AggTradeDeduplicator:
+    """Per-(market, symbol) aggregate_trade_id deduplicator with bounded memory."""
+
+    def __init__(self, max_seen_per_key: int = 100_000) -> None:
+        self._max_seen = max_seen_per_key
+        self._seen: dict[tuple[Market, str], set[int]] = {}
+        self._order: dict[tuple[Market, str], list[int]] = {}
+        self.duplicates_dropped = 0
+
+    def check_and_add(self, market: Market, symbol: str, agg_trade_id: int) -> bool:
+        """Return True if novel, False if duplicate."""
+        key = (market, symbol)
+        s = self._seen.setdefault(key, set())
+        if agg_trade_id in s:
+            self.duplicates_dropped += 1
+            return False
+        s.add(agg_trade_id)
+        q = self._order.setdefault(key, [])
+        q.append(agg_trade_id)
+        if len(q) > self._max_seen:
+            evict = q.pop(0)
+            s.discard(evict)
+        return True
+
+
+class L2SequenceBridge:
+    """Spot & USD-M L2 snapshot+diff_depth bridge with GAP clear and baseline resync."""
+
+    def __init__(self) -> None:
+        self.synced = False
+        self.last_update_id: int | None = None
+        self.gaps_detected = 0
+
+    def make_clear_deltas(self, instrument_id: Any, ts_event: int, ts_init: int) -> Any:
+        from nautilus_trader.model import (
+            BookAction,
+            BookOrder,
+            OrderBookDelta,
+            OrderBookDeltas,
+            OrderSide,
+            Price,
+            Quantity,
+            RecordFlag,
+        )
+
+        clear = OrderBookDelta(
+            instrument_id,
+            BookAction.CLEAR,
+            BookOrder(OrderSide.BUY, Price.from_str("0"), Quantity.from_str("0"), 0),
+            RecordFlag.F_LAST.value,
+            self.last_update_id or 0,
+            ts_event,
+            ts_init,
+        )
+        return OrderBookDeltas(instrument_id, [clear])
+
+    def apply_snapshot(
+        self,
+        *,
+        instrument: Any,
+        bids: Iterable[tuple[Decimal, Decimal]],
+        asks: Iterable[tuple[Decimal, Decimal]],
+        last_update_id: int,
+        ts_event: int,
+        ts_init: int,
+    ) -> Any:
+        from nautilus_trader.model import (
+            BookAction,
+            BookOrder,
+            OrderBookDelta,
+            OrderBookDeltas,
+            OrderSide,
+            Price,
+            Quantity,
+            RecordFlag,
+        )
+
+        self.synced = True
+        self.last_update_id = int(last_update_id)
+        p_dp = instrument.price_precision
+        s_dp = instrument.size_precision
+        entries: list[tuple[OrderSide, Decimal, Decimal]] = [
+            (OrderSide.BUY, Decimal(p), Decimal(q)) for p, q in bids if Decimal(q) > 0
+        ] + [
+            (OrderSide.SELL, Decimal(p), Decimal(q)) for p, q in asks if Decimal(q) > 0
+        ]
+        deltas = [
+            OrderBookDelta(
+                instrument.id,
+                BookAction.CLEAR,
+                BookOrder(OrderSide.BUY, Price.from_decimal_dp(Decimal(0), p_dp), Quantity.from_decimal_dp(Decimal(0), s_dp), 0),
+                RecordFlag.F_SNAPSHOT.value | (RecordFlag.F_LAST.value if not entries else 0),
+                self.last_update_id,
+                ts_event,
+                ts_init,
+            )
+        ]
+        for idx, (side, px, qty) in enumerate(entries):
+            is_last = idx == len(entries) - 1
+            flags = RecordFlag.F_SNAPSHOT.value | (RecordFlag.F_LAST.value if is_last else 0)
+            order = BookOrder(side, Price.from_decimal_dp(px, p_dp), Quantity.from_decimal_dp(qty, s_dp), 0)
+            deltas.append(
+                OrderBookDelta(
+                    instrument.id,
+                    BookAction.ADD,
+                    order,
+                    flags,
+                    self.last_update_id,
+                    ts_event,
+                    ts_init,
+                )
+            )
+        return OrderBookDeltas(instrument.id, deltas)
+
+    def on_gap(self, instrument: Any, ts_event: int, ts_init: int) -> Any:
+        self.synced = False
+        self.gaps_detected += 1
+        return self.make_clear_deltas(instrument.id, ts_event, ts_init)
+
+    def apply_depth_update(
+        self,
+        *,
+        market: Market,
+        instrument: Any,
+        first_update_id: int,
+        final_update_id: int,
+        previous_final_update_id: int | None,
+        bids: Iterable[tuple[Decimal, Decimal]],
+        asks: Iterable[tuple[Decimal, Decimal]],
+        ts_event: int,
+        ts_init: int,
+        quality_flags: tuple[str, ...] = (),
+    ) -> tuple[Any | None, bool]:
+        """Bridge one diff_depth update; returns (OrderBookDeltas | None, gap_detected)."""
+        from nautilus_trader.model import (
+            BookAction,
+            BookOrder,
+            OrderBookDelta,
+            OrderBookDeltas,
+            OrderSide,
+            Price,
+            Quantity,
+            RecordFlag,
+        )
+
+        if "sequence_gap" in quality_flags:
+            return self.on_gap(instrument, ts_event, ts_init), True
+        if not self.synced or self.last_update_id is None:
+            return None, False
+        if final_update_id <= self.last_update_id:
+            return None, False
+
+        is_first_after_snap = first_update_id <= self.last_update_id + 1 <= final_update_id
+        if market == Market.USDM and previous_final_update_id is not None:
+            if not is_first_after_snap and previous_final_update_id != self.last_update_id:
+                return self.on_gap(instrument, ts_event, ts_init), True
+        elif first_update_id > self.last_update_id + 1:
+            return self.on_gap(instrument, ts_event, ts_init), True
+
+        self.last_update_id = final_update_id
+        p_dp = instrument.price_precision
+        s_dp = instrument.size_precision
+        raw_changes: list[tuple[OrderSide, Decimal, Decimal]] = [
+            (OrderSide.BUY, Decimal(p), Decimal(q)) for p, q in bids
+        ] + [
+            (OrderSide.SELL, Decimal(p), Decimal(q)) for p, q in asks
+        ]
+        if not raw_changes:
+            return None, False
+
+        deltas = []
+        for idx, (side, px, qty) in enumerate(raw_changes):
+            is_last = idx == len(raw_changes) - 1
+            action = BookAction.DELETE if qty == 0 else BookAction.UPDATE
+            flags = RecordFlag.F_LAST.value if is_last else 0
+            order = BookOrder(side, Price.from_decimal_dp(px, p_dp), Quantity.from_decimal_dp(qty, s_dp), 0)
+            deltas.append(
+                OrderBookDelta(
+                    instrument.id,
+                    action,
+                    order,
+                    flags,
+                    final_update_id,
+                    ts_event,
+                    ts_init,
+                )
+            )
+        return OrderBookDeltas(instrument.id, deltas), False
+
+
+def bmd_mark_price_to_nautilus(
+    ev: MarkPriceEvent,
+    instrument: Any,
+    *,
+    delay_ns: int = 0,
+) -> tuple[Any, Any]:
+    """Convert BMD MarkPriceEvent -> (MarkPriceUpdate, FundingRateUpdate)."""
+    from nautilus_trader.model import FundingRateUpdate, MarkPriceUpdate, Price
+
+    if ev.receive_time_utc_ns is None or ev.receive_time_utc_ns <= 0:
+        raise ValueError("MarkPriceEvent missing receive_time_utc_ns")
+    ts_event = ev.exchange_event_time_ms * 1_000_000 if ev.exchange_event_time_ms is not None else ev.receive_time_utc_ns
+    ts_init = ev.receive_time_utc_ns + delay_ns
+    mp = MarkPriceUpdate(
+        instrument_id=instrument.id,
+        value=Price.from_decimal_dp(Decimal(ev.mark_price), instrument.price_precision),
+        ts_event=ts_event,
+        ts_init=ts_init,
+    )
+    fr = FundingRateUpdate(
+        instrument_id=instrument.id,
+        rate=Decimal(ev.funding_rate),
+        ts_event=ts_event,
+        ts_init=ts_init,
+        interval=480,
+        next_funding_ns=ev.next_funding_time_ms * 1_000_000,
+    )
+    return mp, fr
+
+
+def bmd_liquidation_to_custom_data(ev: LiquidationEvent, *, delay_ns: int = 0) -> Any:
+    """Convert BMD LiquidationEvent -> CustomData(BmdLiquidation)."""
+    if ev.receive_time_utc_ns is None or ev.receive_time_utc_ns <= 0:
+        raise ValueError("LiquidationEvent missing receive_time_utc_ns")
+    ts_event = ev.order_trade_time_ms * 1_000_000
+    ts_init = ev.receive_time_utc_ns + delay_ns
+    payload = BmdLiquidationData(
+        market=ev.market.value,
+        symbol=ev.symbol,
+        side=ev.side,
+        order_type=ev.order_type,
+        time_in_force=ev.time_in_force,
+        original_quantity=str(ev.original_quantity),
+        price=str(ev.price),
+        average_price=str(ev.average_price) if ev.average_price is not None else None,
+        order_status=ev.order_status,
+        last_filled_quantity=str(ev.last_filled_quantity),
+        accumulated_filled_quantity=str(ev.accumulated_filled_quantity),
+        order_trade_time_ms=ev.order_trade_time_ms,
+        ts_event=ts_event,
+        ts_init=ts_init,
+        delivery_seq=ev.delivery_seq,
+    )
+    return wrap_custom_data(BMD_LIQUIDATION_DATATYPE, payload)
+
+
+def bmd_reference_to_custom_data(ev: ReferenceObservationEvent, *, delay_ns: int = 0) -> Any:
+    """Convert BMD ReferenceObservationEvent -> CustomData(BmdReference)."""
+    ts_init_base = ev.receive_time_utc_ns or ev.observe_time_utc_ns
+    if ts_init_base is None or ts_init_base <= 0:
+        raise ValueError("ReferenceObservationEvent missing receive/observe timestamp")
+    ts_event = ev.source_time_ms * 1_000_000 if ev.source_time_ms is not None else ts_init_base
+    ts_init = ts_init_base + delay_ns
+    payload = BmdReferenceData(
+        market=ev.market.value,
+        symbol=ev.symbol,
+        source_kind=ev.source_kind,
+        status=ev.status,
+        payload_json=ev.payload_json,
+        source_time_ms=ev.source_time_ms,
+        funding_rate_settled=str(ev.funding_rate_settled) if ev.funding_rate_settled is not None else None,
+        funding_time_ms=ev.funding_time_ms,
+        tick_size=str(ev.tick_size) if ev.tick_size is not None else None,
+        step_size=str(ev.step_size) if ev.step_size is not None else None,
+        min_notional=str(ev.min_notional) if ev.min_notional is not None else None,
+        ts_event=ts_event,
+        ts_init=ts_init,
+        delivery_seq=ev.delivery_seq,
+    )
+    return wrap_custom_data(BMD_REFERENCE_DATATYPE, payload)
+
+
 def events_to_nautilus_data(
     events: Iterable[FeedEvent],
     instruments: dict[tuple[Market, str], Any],
     *,
     delay_ns: int = 0,
+    deduplicate_trades: bool = True,
+    include_funding_from_mark_price: bool = False,
 ) -> NautilusConversionSummary:
     """Convert typed BMD FeedEvents to Nautilus data objects preserving delivery order."""
     data: list[Any] = []
     quote_prov: list[dict[str, Any]] = []
     proxy_count = 0
     health_count = 0
+    dedup = AggTradeDeduplicator()
+    bridges: dict[tuple[Market, str], L2SequenceBridge] = {}
     for ev in events:
+        if isinstance(ev, LiquidationEvent):
+            data.append(bmd_liquidation_to_custom_data(ev, delay_ns=delay_ns))
+            continue
+        if isinstance(ev, ReferenceObservationEvent):
+            data.append(bmd_reference_to_custom_data(ev, delay_ns=delay_ns))
+            continue
+
         key = (ev.market, ev.symbol)
         inst = instruments.get(key)
         if inst is None:
@@ -629,9 +923,70 @@ def events_to_nautilus_data(
             data.append(tick)
             quote_prov.append(prov)
         elif isinstance(ev, AggTradeEvent):
+            if deduplicate_trades and not dedup.check_and_add(ev.market, ev.symbol, ev.aggregate_trade_id):
+                continue
             data.append(bmd_agg_trade_to_trade_tick(ev, inst, delay_ns=delay_ns))
+        elif isinstance(ev, OrderBookSnapshotEvent):
+            if ev.receive_time_utc_ns is None or ev.receive_time_utc_ns <= 0:
+                continue
+            bridge = bridges.setdefault(key, L2SequenceBridge())
+            ts_ev = ev.exchange_event_time_ms * 1_000_000 if ev.exchange_event_time_ms is not None else ev.receive_time_utc_ns
+            data.append(
+                bridge.apply_snapshot(
+                    instrument=inst,
+                    bids=ev.bids,
+                    asks=ev.asks,
+                    last_update_id=ev.last_update_id,
+                    ts_event=ts_ev,
+                    ts_init=ev.receive_time_utc_ns + delay_ns,
+                )
+            )
+        elif isinstance(ev, DepthUpdateEvent):
+            if ev.receive_time_utc_ns is None or ev.receive_time_utc_ns <= 0:
+                continue
+            bridge = bridges.setdefault(key, L2SequenceBridge())
+            ts_ev = ev.exchange_event_time_ms * 1_000_000 if ev.exchange_event_time_ms is not None else ev.receive_time_utc_ns
+            ts_in = ev.receive_time_utc_ns + delay_ns
+            deltas, gap_hit = bridge.apply_depth_update(
+                market=ev.market,
+                instrument=inst,
+                first_update_id=ev.first_update_id,
+                final_update_id=ev.final_update_id,
+                previous_final_update_id=ev.previous_final_update_id,
+                bids=ev.bids,
+                asks=ev.asks,
+                ts_event=ts_ev,
+                ts_init=ts_in,
+                quality_flags=ev.quality_flags,
+            )
+            if deltas is not None:
+                data.append(deltas)
+            if gap_hit:
+                health_count += 1
+                data.append(
+                    bmd_health_to_instrument_status(
+                        StreamHealthEvent(
+                            venue=ev.venue,
+                            market=ev.market,
+                            symbol=ev.symbol,
+                            stream=Stream.DIFF_DEPTH,
+                            status="GAP",
+                            reason="l2_sequence_gap",
+                            observed_time_utc_ns=ev.receive_time_utc_ns,
+                        ),
+                        inst,
+                        delay_ns=delay_ns,
+                    )
+                )
+        elif isinstance(ev, MarkPriceEvent):
+            mp, fr = bmd_mark_price_to_nautilus(ev, inst, delay_ns=delay_ns)
+            data.append(mp)
+            if include_funding_from_mark_price:
+                data.append(fr)
         elif isinstance(ev, StreamHealthEvent):
             health_count += 1
+            if ev.stream == Stream.DIFF_DEPTH and ev.status in ("GAP", "STALE") and key in bridges:
+                data.append(bridges[key].on_gap(inst, ev.observed_time_utc_ns, ev.observed_time_utc_ns + delay_ns))
             data.append(bmd_health_to_instrument_status(ev, inst, delay_ns=delay_ns))
     return NautilusConversionSummary(
         data=data,
@@ -642,6 +997,8 @@ def events_to_nautilus_data(
 
 
 __all__ = [
+    "AggTradeDeduplicator",
+    "L2SequenceBridge",
     "NautilusConversionSummary",
     "RawEnvelopeRecord",
     "RecorderArtifactError",
@@ -649,6 +1006,9 @@ __all__ = [
     "bmd_agg_trade_to_trade_tick",
     "bmd_book_ticker_to_quote_tick",
     "bmd_health_to_instrument_status",
+    "bmd_liquidation_to_custom_data",
+    "bmd_mark_price_to_nautilus",
+    "bmd_reference_to_custom_data",
     "events_to_nautilus_data",
     "iter_raw_chunk_records",
     "load_mcp_export_chunks",

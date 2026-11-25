@@ -47,11 +47,12 @@ def purged_embargoed_splits(
             val_idx = tuple(range(val_start_idx, val_end_idx))
             val_start_ns = timestamps_ns[val_start_idx]
             val_end_ns = max(label_end_times_ns[i] for i in val_idx)
-            # Purge: reject any past training sample whose label horizon reaches >= val_start_ns
+            # Purge overlapping labels and honor embargo_ns gap before val_start_ns
             train_idx = tuple(
                 i
                 for i in range(0, val_start_idx)
                 if label_end_times_ns[i] < val_start_ns
+                and (embargo_ns <= 0 or (label_end_times_ns[i] + embargo_ns) <= val_start_ns)
             )
             folds.append(
                 WalkForwardFold(
