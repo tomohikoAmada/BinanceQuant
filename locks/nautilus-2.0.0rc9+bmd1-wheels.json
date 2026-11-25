@@ -1,0 +1,23 @@
+{
+  "package": "nautilus-trader",
+  "version": "2.0.0rc9+bmd1",
+  "python_requires": ">=3.13,<3.16",
+  "license": "LGPL-3.0-only",
+  "upstream_repo": "https://github.com/nautechsystems/nautilus_trader",
+  "fork_repo": "https://github.com/tomohikoAmada/nautilus_trader",
+  "branch": "bmd-2.0.0rc9-bmd1",
+  "commit": "d1dee21c17d549d13ff4192b6db92ddf3c2c143e",
+  "rollback_baseline_manifest": "locks/nautilus-2.0.0rc9-wheels.json",
+  "wheels_cp313": {
+    "macosx_11_0_arm64": {
+      "filename": "nautilus_trader-2.0.0rc9+bmd1-cp313-cp313-macosx_11_0_arm64.whl",
+      "sha256": "41ac865843decfa173be49f647f3a404e6cf1bc28d317eada9240424f7d55a8a",
+      "build_profile": "release (lto=fat)"
+    },
+    "manylinux_2_39_x86_64": {
+      "filename": "nautilus_trader-2.0.0rc9+bmd1-cp313-cp313-manylinux_2_39_x86_64.whl",
+      "sha256": "f582eb535d16e7ac7374263a413b60eb1c9f69aaa21facc46e9709cef6cc59d7",
+      "build_profile": "release (CARGO_PROFILE_RELEASE_LTO=thin)"
+    }
+  }
+}

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
+from importlib.metadata import version
 from typing import Any
 
 import grpc
@@ -256,10 +257,19 @@ def test_route_b_native_rust_binance_gap_recovery_semantics() -> None:
     )
     audit = res["gap_recovery_audit"]
     assert res["deltas_events"] >= 4
-    # Empirically verifies rc9 BookSyncTracker does NOT emit InstrumentStatus(HALT) on GAP
     assert audit["status_halts_observed"] == 0
-    assert audit["book_clears_observed"] == 2
     tl = audit["timeline"]
-    idx_recover = next(i for i, row in enumerate(tl) if i > 0 and row["has_clear"])
-    stale_window_ms = (tl[idx_recover]["cb_ns"] - tl[idx_recover - 1]["cb_ns"]) / 1_000_000.0
-    assert stale_window_ms >= 100.0
+    clear_indices = [i for i, row in enumerate(tl) if row["has_clear"]]
+    if "bmd" in version("nautilus_trader"):
+        # Patched 2.0.0rc9+bmd1 emits an immediate gap CLEAR (sequence=0) BEFORE delayed snapshot resync
+        assert audit["book_clears_observed"] == 3
+        assert len(clear_indices) == 3
+        gap_clear_idx = clear_indices[1]
+        resync_idx = clear_indices[2]
+        assert (tl[resync_idx]["cb_ns"] - tl[gap_clear_idx]["cb_ns"]) / 1_000_000.0 >= 100.0
+    else:
+        # Upstream rc9 baseline did NOT emit CLEAR on GAP detection (stale book held until snapshot)
+        assert audit["book_clears_observed"] == 2
+        idx_recover = next(i for i, row in enumerate(tl) if i > 0 and row["has_clear"])
+        stale_window_ms = (tl[idx_recover]["cb_ns"] - tl[idx_recover - 1]["cb_ns"]) / 1_000_000.0
+        assert stale_window_ms >= 100.0

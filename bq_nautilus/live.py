@@ -39,11 +39,13 @@ from .custom_data import (
     BMD_LIQUIDATION_TYPE_NAME,
     BMD_REFERENCE_DATATYPE,
     BMD_REFERENCE_TYPE_NAME,
+    BMD_STREAM_QUALITY_DATATYPE,
     BmdLiquidationData,
     BmdReferenceData,
+    BmdStreamQualityData,
     wrap_custom_data,
 )
-from .recorder import AggTradeDeduplicator, L2SequenceBridge
+from .recorder import AggTradeDeduplicator, L2SequenceBridge, resolve_event_ts_ns
 
 _MARKET_TO_PROTO = {
     Market.SPOT: enums_pb2.MARKET_SPOT,
@@ -130,6 +132,9 @@ class BmdDataClient(MarketDataClient):
         self._mono_ns = monotonic_ns_fn or time.monotonic_ns
         self._utc_ns = utc_ns_fn or time.time_ns
         self._utc_anchor: tuple[int, int] | None = None
+        self._inst_meta: dict[Any, tuple[Market, str]] = {
+            inst.id: (mkt, sym) for mkt, sym, inst in self._cfg.instruments.values()
+        }
         self._last_activity_mono: dict[tuple[Any, Stream], int] = {}
         self._stream_stale: dict[Any, set[Stream]] = defaultdict(set)
         self._stream_gap: dict[Any, set[Stream]] = defaultdict(set)
@@ -155,26 +160,44 @@ class BmdDataClient(MarketDataClient):
             return a_utc + (mono_ns - a_mono)
         return self._utc_ns()
 
-    def _emit_status(self, inst_id: Any, *, healthy: bool, reason: str, ts_ns: int) -> None:
-        action = MarketStatusAction.TRADING if healthy else MarketStatusAction.HALT
-        msg = InstrumentStatus(
-            instrument_id=inst_id,
-            action=action,
+    def _emit_stream_quality(
+        self,
+        market: Market,
+        symbol: str,
+        inst_id: Any,
+        stream: Stream,
+        *,
+        status: str,
+        reason: str,
+        ts_ns: int,
+        connection_generation: int | None = None,
+    ) -> None:
+        healthy = status == "LIVE"
+        payload = BmdStreamQualityData(
+            market=market.value,
+            symbol=symbol,
+            stream=stream.value,
+            status=status,
+            reason=reason,
+            observed_time_utc_ns=ts_ns,
             ts_event=ts_ns,
             ts_init=ts_ns,
-            reason=reason,
-            is_trading=healthy,
-            is_quoting=healthy,
+            connection_generation=connection_generation,
         )
         self._cfg.stats["health_events"].append(
             {
                 "instrument_id": str(inst_id),
+                "market": market.value,
+                "symbol": symbol,
+                "stream": stream.value,
+                "status": status,
                 "healthy": healthy,
                 "reason": reason,
                 "ts_ns": ts_ns,
+                "connection_generation": connection_generation,
             }
         )
-        self._handle_data(msg)
+        self._handle_data(wrap_custom_data(BMD_STREAM_QUALITY_DATATYPE, payload))
 
     def _register_activity_key(self, inst_id: Any, stream: Stream, now_mono: int) -> None:
         if stream in _SPARSE_STREAMS and self._cfg.sparse_stale_threshold_ns is None:
@@ -183,6 +206,8 @@ class BmdDataClient(MarketDataClient):
 
     def _mark_healthy_activity(
         self,
+        market: Market,
+        symbol: str,
         inst_id: Any,
         stream: Stream,
         now_mono: int,
@@ -190,14 +215,26 @@ class BmdDataClient(MarketDataClient):
         *,
         recovery_reason: str,
         allow_gap_clear: bool = False,
+        connection_generation: int | None = None,
     ) -> None:
         self._register_activity_key(inst_id, stream, now_mono)
+        was_stale = stream in self._stream_stale[inst_id]
+        was_gap = stream in self._stream_gap[inst_id]
+        self._stream_stale[inst_id].discard(stream)
         if allow_gap_clear:
             self._stream_gap[inst_id].discard(stream)
-        was_stale = stream in self._stream_stale[inst_id]
-        self._stream_stale[inst_id].discard(stream)
-        if was_stale and not self._stream_stale[inst_id] and not self._stream_gap[inst_id]:
-            self._emit_status(inst_id, healthy=True, reason=recovery_reason, ts_ns=ts_ns)
+        stream_is_clear = stream not in self._stream_stale[inst_id] and stream not in self._stream_gap[inst_id]
+        if (was_stale or (allow_gap_clear and was_gap)) and stream_is_clear:
+            self._emit_stream_quality(
+                market,
+                symbol,
+                inst_id,
+                stream,
+                status="LIVE",
+                reason=recovery_reason,
+                ts_ns=ts_ns,
+                connection_generation=connection_generation,
+            )
 
     def _check_stream_cap(self, market: Market, symbol: str, stream: Stream) -> None:
         if not self._gateway_caps:
@@ -301,9 +338,13 @@ class BmdDataClient(MarketDataClient):
                     continue
                 if stream not in self._stream_stale[inst_id] and (now_mono - last_mono) > thresh:
                     self._stream_stale[inst_id].add(stream)
-                    self._emit_status(
+                    mkt, sym = self._inst_meta.get(inst_id, (Market.SPOT, ""))
+                    self._emit_stream_quality(
+                        mkt,
+                        sym,
                         inst_id,
-                        healthy=False,
+                        stream,
+                        status="STALE",
                         reason=f"STALE:{stream.value}:watchdog_timeout>{thresh}ns",
                         ts_ns=self._anchored_utc_ns(now_mono),
                     )
@@ -344,11 +385,18 @@ class BmdDataClient(MarketDataClient):
         *,
         name: str,
         env: Any,
+        market: Market,
+        symbol: str,
         inst: Any,
         stream: Stream,
         now_mono: int,
     ) -> bool:
         """Handle subscription_accepted / consumer_gap / stream_status; returns True if consumed."""
+        gen = (
+            int(env.delivery_metadata.connection_generation)
+            if env.delivery_metadata.HasField("connection_generation")
+            else None
+        )
         if name == "subscription_accepted":
             self._cfg.stats["accepted"] += 1
             self._register_activity_key(inst.id, stream, now_mono)
@@ -359,11 +407,15 @@ class BmdDataClient(MarketDataClient):
             self._stream_gap[inst.id].add(stream)
             if stream == Stream.DIFF_DEPTH and inst.id in self._l2_bridges:
                 self._handle_data(self._l2_bridges[inst.id].on_gap(inst, ts_ns, ts_ns))
-            self._emit_status(
+            self._emit_stream_quality(
+                market,
+                symbol,
                 inst.id,
-                healthy=False,
+                stream,
+                status="GAP",
                 reason=f"GAP:{stream.value}:{gap.reason}",
                 ts_ns=ts_ns,
+                connection_generation=gen,
             )
             return True
         if name == "stream_status":
@@ -373,17 +425,22 @@ class BmdDataClient(MarketDataClient):
             if healthy:
                 self._register_activity_key(inst.id, stream, now_mono)
                 self._stream_stale[inst.id].discard(stream)
-                self._stream_gap[inst.id].discard(stream)
+                if stream != Stream.DIFF_DEPTH:
+                    self._stream_gap[inst.id].discard(stream)
             else:
                 self._stream_gap[inst.id].add(stream)
                 if stream == Stream.DIFF_DEPTH and inst.id in self._l2_bridges:
                     self._handle_data(self._l2_bridges[inst.id].on_gap(inst, ts_ns, ts_ns))
             msg = st.message if st.HasField("message") else f"state:{st.state}"
-            self._emit_status(
+            self._emit_stream_quality(
+                market,
+                symbol,
                 inst.id,
-                healthy=healthy,
+                stream,
+                status="LIVE" if healthy else "DEGRADED",
                 reason=f"{'LIVE' if healthy else 'DEGRADED'}:{stream.value}:{msg}",
                 ts_ns=ts_ns,
+                connection_generation=gen,
             )
             return True
         return False
@@ -555,6 +612,8 @@ class BmdDataClient(MarketDataClient):
                 if self._handle_control_payload(
                     name=name,
                     env=env,
+                    market=market,
+                    symbol=symbol,
                     inst=inst,
                     stream=Stream.BOOK_TICKER,
                     now_mono=now_mono,
@@ -570,6 +629,8 @@ class BmdDataClient(MarketDataClient):
                 recv_ns = int(meta.receive_time_utc_ns)
                 self._utc_anchor = (recv_ns, now_mono)
                 self._mark_healthy_activity(
+                    market,
+                    symbol,
                     inst.id,
                     Stream.BOOK_TICKER,
                     now_mono,
@@ -577,10 +638,18 @@ class BmdDataClient(MarketDataClient):
                     recovery_reason="LIVE:recovered_on_quote",
                 )
 
-                ts_event = (
-                    int(meta.exchange_event_time_ms) * 1_000_000
-                    if meta.HasField("exchange_event_time_ms")
-                    else recv_ns
+                exch_e = int(meta.exchange_event_time_ms) if meta.HasField("exchange_event_time_ms") else None
+                exch_t = (
+                    int(meta.exchange_transaction_time_ms)
+                    if meta.HasField("exchange_transaction_time_ms")
+                    else None
+                )
+                ts_event, ts_event_source = resolve_event_ts_ns(
+                    market,
+                    stream=Stream.BOOK_TICKER,
+                    receive_time_utc_ns=recv_ns,
+                    exchange_event_time_ms=exch_e,
+                    exchange_transaction_time_ms=exch_t,
                 )
                 tick = QuoteTick(
                     instrument_id=inst.id,
@@ -599,12 +668,10 @@ class BmdDataClient(MarketDataClient):
                             "update_id": int(bt.update_id) if bt.HasField("update_id") else None,
                             "gateway_receive_ns": recv_ns,
                             "adapter_read_ns": read_ns,
+                            "exchange_event_time_ms": exch_e,
+                            "exchange_transaction_time_ms": exch_t,
                             "ts_event": ts_event,
-                            "ts_event_source": (
-                                "exchange_event_time_ms"
-                                if meta.HasField("exchange_event_time_ms")
-                                else "capture_receive_proxy"
-                            ),
+                            "ts_event_source": ts_event_source,
                             "bid": bt.best_bid_price,
                             "ask": bt.best_ask_price,
                             "bid_size": bt.best_bid_quantity,
@@ -643,6 +710,8 @@ class BmdDataClient(MarketDataClient):
                 if self._handle_control_payload(
                     name=name,
                     env=env,
+                    market=market,
+                    symbol=symbol,
                     inst=inst,
                     stream=Stream.AGG_TRADE,
                     now_mono=now_mono,
@@ -657,11 +726,14 @@ class BmdDataClient(MarketDataClient):
                 recv_ns = int(meta.receive_time_utc_ns)
                 self._utc_anchor = (recv_ns, now_mono)
                 self._mark_healthy_activity(
+                    market,
+                    symbol,
                     inst.id,
                     Stream.AGG_TRADE,
                     now_mono,
                     read_ns,
                     recovery_reason="LIVE:recovered_on_trade",
+                    allow_gap_clear=True,
                 )
                 agg_id = int(at.aggregate_trade_id)
                 if self._cfg.dedup_agg_trades and not self._dedup.check_and_add(market, symbol, agg_id):
@@ -709,6 +781,8 @@ class BmdDataClient(MarketDataClient):
                 if self._handle_control_payload(
                     name=name,
                     env=env,
+                    market=market,
+                    symbol=symbol,
                     inst=inst,
                     stream=Stream.DIFF_DEPTH,
                     now_mono=now_mono,
@@ -735,22 +809,28 @@ class BmdDataClient(MarketDataClient):
                     self._cfg.stats["items_received"] += 1
                     self._cfg.stats["dequeue_latencies_ns"].append(read_ns - recv_ns)
                     self._handle_data(deltas)
-                    was_halted = bool(self._stream_gap[inst.id] or self._stream_stale[inst.id])
+                    was_halted = (
+                        Stream.DIFF_DEPTH in self._stream_gap[inst.id]
+                        or Stream.DIFF_DEPTH in self._stream_stale[inst.id]
+                    )
+                    gen = (
+                        int(env.delivery_metadata.connection_generation)
+                        if env.delivery_metadata.HasField("connection_generation")
+                        else None
+                    )
                     self._mark_healthy_activity(
+                        market,
+                        symbol,
                         inst.id,
                         Stream.DIFF_DEPTH,
                         now_mono,
                         read_ns,
-                        recovery_reason="LIVE:l2_baseline_recovered",
+                        recovery_reason="LIVE:l2_baseline_resync",
                         allow_gap_clear=True,
+                        connection_generation=gen,
                     )
-                    if was_halted and not self._stream_gap[inst.id] and not self._stream_stale[inst.id]:
-                        self._emit_status(
-                            inst.id,
-                            healthy=True,
-                            reason="LIVE:l2_baseline_resync",
-                            ts_ns=read_ns,
-                        )
+                    if not was_halted:
+                        self._stream_gap[inst.id].discard(Stream.DIFF_DEPTH)
                     if self._reached_max_items():
                         break
                     continue
@@ -763,12 +843,24 @@ class BmdDataClient(MarketDataClient):
                 meta = du.metadata
                 recv_ns = int(meta.receive_time_utc_ns)
                 self._utc_anchor = (recv_ns, now_mono)
-                ts_event = (
-                    int(meta.exchange_event_time_ms) * 1_000_000
-                    if meta.HasField("exchange_event_time_ms")
-                    else recv_ns
+                ts_event, _ = resolve_event_ts_ns(
+                    market,
+                    stream=Stream.DIFF_DEPTH,
+                    receive_time_utc_ns=recv_ns,
+                    exchange_event_time_ms=(
+                        int(meta.exchange_event_time_ms)
+                        if meta.HasField("exchange_event_time_ms")
+                        else None
+                    ),
+                    exchange_transaction_time_ms=(
+                        int(meta.exchange_transaction_time_ms)
+                        if meta.HasField("exchange_transaction_time_ms")
+                        else None
+                    ),
                 )
                 self._mark_healthy_activity(
+                    market,
+                    symbol,
                     inst.id,
                     Stream.DIFF_DEPTH,
                     now_mono,
@@ -792,12 +884,21 @@ class BmdDataClient(MarketDataClient):
                 if deltas is not None:
                     self._handle_data(deltas)
                 if gap_hit:
+                    gen = (
+                        int(env.delivery_metadata.connection_generation)
+                        if env.delivery_metadata.HasField("connection_generation")
+                        else None
+                    )
                     self._stream_gap[inst.id].add(Stream.DIFF_DEPTH)
-                    self._emit_status(
+                    self._emit_stream_quality(
+                        market,
+                        symbol,
                         inst.id,
-                        healthy=False,
+                        Stream.DIFF_DEPTH,
+                        status="GAP",
                         reason="GAP:l2_sequence_gap",
                         ts_ns=read_ns,
+                        connection_generation=gen,
                     )
                 if self._reached_max_items():
                     break
@@ -824,6 +925,8 @@ class BmdDataClient(MarketDataClient):
                 if self._handle_control_payload(
                     name=name,
                     env=env,
+                    market=market,
+                    symbol=symbol,
                     inst=inst,
                     stream=Stream.MARK_PRICE,
                     now_mono=now_mono,
@@ -838,6 +941,8 @@ class BmdDataClient(MarketDataClient):
                 recv_ns = int(meta.receive_time_utc_ns)
                 self._utc_anchor = (recv_ns, now_mono)
                 self._mark_healthy_activity(
+                    market,
+                    symbol,
                     inst.id,
                     Stream.MARK_PRICE,
                     now_mono,
@@ -868,7 +973,7 @@ class BmdDataClient(MarketDataClient):
                             rate=Decimal(mp.funding_rate),
                             ts_event=ts_event,
                             ts_init=read_ns,
-                            interval=480,
+                            interval=None,
                             next_funding_ns=int(mp.next_funding_time_ms) * 1_000_000,
                         )
                     )
@@ -902,6 +1007,8 @@ class BmdDataClient(MarketDataClient):
                 if self._handle_control_payload(
                     name=name,
                     env=env,
+                    market=market,
+                    symbol=symbol,
                     inst=inst,
                     stream=stream_kind,
                     now_mono=now_mono,
@@ -913,6 +1020,8 @@ class BmdDataClient(MarketDataClient):
                     recv_ns = int(lq.metadata.receive_time_utc_ns)
                     self._utc_anchor = (recv_ns, now_mono)
                     self._mark_healthy_activity(
+                        market,
+                        symbol,
                         inst.id,
                         Stream.LIQUIDATION,
                         now_mono,
@@ -943,6 +1052,8 @@ class BmdDataClient(MarketDataClient):
                     recv_ns = int(ro.receive_time_utc_ns)
                     self._utc_anchor = (recv_ns, now_mono)
                     self._mark_healthy_activity(
+                        market,
+                        symbol,
                         inst.id,
                         Stream.REFERENCE_DATA,
                         now_mono,

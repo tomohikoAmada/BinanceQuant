@@ -31,6 +31,11 @@ from nautilus_trader.model import (
 
 from bq_feed.events import Market, Stream
 from bq_feed.live import CapabilityMismatchError
+from .custom_data import (
+    BMD_STREAM_QUALITY_DATATYPE,
+    BmdStreamQualityData,
+    wrap_custom_data,
+)
 
 VENUE = Venue("BINANCE")
 
@@ -218,20 +223,49 @@ class BmdTonicDataClient(MarketDataClient):
     async def _unsubscribe_funding_rates(self, command: Any) -> None:
         return None
 
-    def _emit_status(self, inst_id: Any, *, healthy: bool, reason: str, ts_ns: int) -> None:
-        msg = InstrumentStatus(
-            instrument_id=inst_id,
-            action=MarketStatusAction.TRADING if healthy else MarketStatusAction.HALT,
+    def _emit_stream_quality(
+        self,
+        market: Market,
+        symbol: str,
+        inst_id: Any,
+        stream_code: int,
+        *,
+        healthy: bool,
+        reason: str,
+        ts_ns: int,
+    ) -> None:
+        stream_name = {
+            1: Stream.DIFF_DEPTH.value,
+            2: Stream.AGG_TRADE.value,
+            3: Stream.BOOK_TICKER.value,
+            5: Stream.MARK_PRICE.value,
+            6: Stream.LIQUIDATION.value,
+            7: Stream.REFERENCE_DATA.value,
+        }.get(stream_code, str(stream_code))
+        status = "LIVE" if healthy else ("GAP" if "GAP" in reason else "DEGRADED")
+        payload = BmdStreamQualityData(
+            market=market.value,
+            symbol=symbol,
+            stream=stream_name,
+            status=status,
+            reason=reason,
+            observed_time_utc_ns=ts_ns,
             ts_event=ts_ns,
             ts_init=ts_ns,
-            reason=reason,
-            is_trading=healthy,
-            is_quoting=healthy,
         )
         self._cfg.stats["health_events"].append(
-            {"instrument_id": str(inst_id), "healthy": healthy, "reason": reason, "ts_ns": ts_ns}
+            {
+                "instrument_id": str(inst_id),
+                "market": market.value,
+                "symbol": symbol,
+                "stream": stream_name,
+                "status": status,
+                "healthy": healthy,
+                "reason": reason,
+                "ts_ns": ts_ns,
+            }
         )
-        self._handle_data(msg)
+        self._handle_data(wrap_custom_data(BMD_STREAM_QUALITY_DATATYPE, payload))
 
     async def _pump_batches(self) -> None:
         inst_list = self._inst_list
@@ -244,7 +278,7 @@ class BmdTonicDataClient(MarketDataClient):
             self._cfg.stats["batches"] += 1
             for ev in batch:
                 kind = ev.kind
-                _, _, inst = inst_list[ev.inst_idx]
+                market, symbol, inst = inst_list[ev.inst_idx]
                 if kind == _KIND_ACCEPTED:
                     self._cfg.stats["accepted"] += 1
                     continue
@@ -255,7 +289,15 @@ class BmdTonicDataClient(MarketDataClient):
                     continue
                 if kind == _KIND_STATUS:
                     ts_ns = int(ev.ts_event) or int(ev.rust_read_ns)
-                    self._emit_status(inst.id, healthy=bool(ev.b_flag), reason=ev.reason, ts_ns=ts_ns)
+                    self._emit_stream_quality(
+                        market,
+                        symbol,
+                        inst.id,
+                        int(ev.stream_code),
+                        healthy=bool(ev.b_flag),
+                        reason=ev.reason,
+                        ts_ns=ts_ns,
+                    )
                     continue
 
                 p_dp = inst.price_precision
@@ -354,7 +396,7 @@ class BmdTonicDataClient(MarketDataClient):
                                 rate=Decimal(ev.q1),
                                 ts_event=ts_ev,
                                 ts_init=rust_read,
-                                interval=480,
+                                interval=None,
                                 next_funding_ns=int(ev.u1),
                             )
                         )

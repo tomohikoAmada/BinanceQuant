@@ -33,8 +33,10 @@ from bq_feed.events import (
 from .custom_data import (
     BMD_LIQUIDATION_DATATYPE,
     BMD_REFERENCE_DATATYPE,
+    BMD_STREAM_QUALITY_DATATYPE,
     BmdLiquidationData,
     BmdReferenceData,
+    BmdStreamQualityData,
     wrap_custom_data,
 )
 from bq_feed.replay import (
@@ -335,6 +337,65 @@ def load_partition_chunks(
     return refs
 
 
+def _partition_matches_market_filter(
+    part_market: str | None,
+    market_filter: set[Market] | None,
+) -> bool:
+    if not market_filter:
+        return True
+    if not part_market or part_market in {"__MIXED__", "mixed"}:
+        return True
+    try:
+        return _parse_market(part_market) in market_filter
+    except ValueError:
+        return False
+
+
+def _resolve_candidate_archive_roots(
+    manifest: dict[str, Any],
+    part_market: str,
+    partition_id: str,
+) -> list[Path]:
+    markets_map = manifest.get("markets", {})
+    candidate_keys: list[str] = [part_market]
+    try:
+        parsed_mkt = _parse_market(part_market)
+        for cand in _MARKET_TO_RECORDER_CANDIDATES.get(parsed_mkt, ()):
+            if cand not in candidate_keys:
+                candidate_keys.append(cand)
+    except ValueError:
+        pass
+    out: list[Path] = []
+    seen: set[Path] = set()
+    for key in candidate_keys:
+        for raw_root in markets_map.get(key, {}).get("active_roots", []):
+            p = Path(raw_root) / "partitions" / partition_id
+            if p not in seen:
+                seen.add(p)
+                out.append(p)
+    return out
+
+
+def resolve_event_ts_ns(
+    market: Market,
+    *,
+    stream: Stream,
+    receive_time_utc_ns: int,
+    exchange_event_time_ms: int | None = None,
+    exchange_transaction_time_ms: int | None = None,
+) -> tuple[int, str]:
+    """Select canonical ts_event + provenance label aligned with native Rust clients."""
+    if market == Market.USDM and stream in (Stream.BOOK_TICKER, Stream.DIFF_DEPTH):
+        if exchange_transaction_time_ms is not None:
+            return int(exchange_transaction_time_ms) * 1_000_000, "exchange_transaction_time_ms"
+        if exchange_event_time_ms is not None:
+            return int(exchange_event_time_ms) * 1_000_000, "exchange_event_time_ms_fallback"
+        return receive_time_utc_ns, "capture_receive_proxy"
+    if exchange_event_time_ms is not None:
+        return int(exchange_event_time_ms) * 1_000_000, "exchange_event_time_ms"
+    return receive_time_utc_ns, "capture_receive_proxy"
+
+
 def load_mcp_export_chunks(
     export_root: Path,
     *,
@@ -360,26 +421,18 @@ def load_mcp_export_chunks(
         if stream_filter is not None
         else None
     )
-    rec_markets = (
-        {_MARKET_TO_RECORDER_CANDIDATES[m][0] for m in market_filter if m in _MARKET_TO_RECORDER_CANDIDATES}
-        if market_filter
-        else None
-    )
     refs: list[VerifiedChunkRef] = []
     seen_chunks: set[str] = set()
     for part in manifest.get("partitions", []):
-        if rec_markets and part.get("market") not in rec_markets:
+        part_market = str(part.get("market", ""))
+        if not _partition_matches_market_filter(part_market, market_filter):
             continue
         chunks_url = str(part["files"]["chunks_jsonl"]["url_path"])
         rel = chunks_url.removeprefix("export/")
         chunks_jsonl = export_root / rel
         if not chunks_jsonl.is_file():
             continue
-        part_market = str(part["market"])
-        active_roots = [
-            Path(p) / "partitions" / str(part["partition_id"])
-            for p in manifest.get("markets", {}).get(part_market, {}).get("active_roots", [])
-        ]
+        active_roots = _resolve_candidate_archive_roots(manifest, part_market, str(part["partition_id"]))
         with chunks_jsonl.open("r", encoding="utf-8") as fh:
             for line in fh:
                 if not line.strip():
@@ -536,12 +589,13 @@ def bmd_book_ticker_to_quote_tick(
 
     if ev.receive_time_utc_ns is None or ev.receive_time_utc_ns <= 0:
         raise ValueError("BookTickerEvent missing receive_time_utc_ns")
-    if ev.exchange_event_time_ms is not None:
-        ts_event = ev.exchange_event_time_ms * 1_000_000
-        ts_event_source = "exchange_event_time_ms"
-    else:
-        ts_event = ev.receive_time_utc_ns
-        ts_event_source = "capture_receive_proxy"
+    ts_event, ts_event_source = resolve_event_ts_ns(
+        ev.market,
+        stream=Stream.BOOK_TICKER,
+        receive_time_utc_ns=ev.receive_time_utc_ns,
+        exchange_event_time_ms=ev.exchange_event_time_ms,
+        exchange_transaction_time_ms=ev.exchange_transaction_time_ms,
+    )
     ts_init = ev.receive_time_utc_ns + delay_ns
     p_dp = instrument.price_precision
     s_dp = instrument.size_precision
@@ -557,6 +611,8 @@ def bmd_book_ticker_to_quote_tick(
     prov = {
         "update_id": ev.update_id,
         "delivery_seq": ev.delivery_seq,
+        "exchange_event_time_ms": ev.exchange_event_time_ms,
+        "exchange_transaction_time_ms": ev.exchange_transaction_time_ms,
         "ts_event": ts_event,
         "ts_init": ts_init,
         "ts_event_source": ts_event_source,
@@ -594,13 +650,35 @@ def bmd_agg_trade_to_trade_tick(
     )
 
 
+def bmd_health_to_stream_quality(
+    ev: StreamHealthEvent,
+    *,
+    delay_ns: int = 0,
+) -> Any:
+    """Convert BMD StreamHealthEvent -> CustomData(BmdStreamQuality) without mutating InstrumentStatus."""
+    ts_ev = ev.observed_time_utc_ns
+    payload = BmdStreamQualityData(
+        market=ev.market.value,
+        symbol=ev.symbol,
+        stream=ev.stream.value,
+        status=ev.status,
+        reason=ev.reason,
+        observed_time_utc_ns=ts_ev,
+        ts_event=ts_ev,
+        ts_init=ts_ev + delay_ns,
+        connection_generation=ev.connection_generation,
+        delivery_seq=ev.delivery_seq,
+    )
+    return wrap_custom_data(BMD_STREAM_QUALITY_DATATYPE, payload)
+
+
 def bmd_health_to_instrument_status(
     ev: StreamHealthEvent,
     instrument: Any,
     *,
     delay_ns: int = 0,
 ) -> Any:
-    """Convert BMD StreamHealthEvent -> Nautilus InstrumentStatus."""
+    """Convert an explicit venue status event -> Nautilus InstrumentStatus."""
     from nautilus_trader.model import InstrumentStatus, MarketStatusAction
 
     healthy = ev.status == "LIVE"
@@ -643,10 +721,11 @@ class AggTradeDeduplicator:
 
 
 class L2SequenceBridge:
-    """Spot & USD-M L2 snapshot+diff_depth bridge with GAP clear and baseline resync."""
+    """Spot & USD-M L2 snapshot+diff_depth bridge with explicit awaiting-first-diff vs bridged state."""
 
     def __init__(self) -> None:
         self.synced = False
+        self.bridged = False
         self.last_update_id: int | None = None
         self.gaps_detected = 0
 
@@ -694,7 +773,9 @@ class L2SequenceBridge:
             RecordFlag,
         )
 
-        self.synced = True
+        # Snapshot seeds baseline ID, but bridge is NOT synchronized until the first valid diff links it.
+        self.synced = False
+        self.bridged = False
         self.last_update_id = int(last_update_id)
         p_dp = instrument.price_precision
         s_dp = instrument.size_precision
@@ -733,8 +814,11 @@ class L2SequenceBridge:
 
     def on_gap(self, instrument: Any, ts_event: int, ts_init: int) -> Any:
         self.synced = False
+        self.bridged = False
         self.gaps_detected += 1
-        return self.make_clear_deltas(instrument.id, ts_event, ts_init)
+        clear = self.make_clear_deltas(instrument.id, ts_event, ts_init)
+        self.last_update_id = None
+        return clear
 
     def apply_depth_update(
         self,
@@ -764,17 +848,39 @@ class L2SequenceBridge:
 
         if "sequence_gap" in quality_flags:
             return self.on_gap(instrument, ts_event, ts_init), True
-        if not self.synced or self.last_update_id is None:
-            return None, False
-        if final_update_id <= self.last_update_id:
+        if self.last_update_id is None:
             return None, False
 
-        is_first_after_snap = first_update_id <= self.last_update_id + 1 <= final_update_id
-        if market == Market.USDM and previous_final_update_id is not None:
-            if not is_first_after_snap and previous_final_update_id != self.last_update_id:
+        snap_or_prev = self.last_update_id
+        if not self.bridged:
+            if market == Market.USDM:
+                if final_update_id < snap_or_prev:
+                    return None, False
+                bridges_snap = first_update_id <= snap_or_prev <= final_update_id
+                continues_seam = (
+                    previous_final_update_id == snap_or_prev
+                    and first_update_id <= snap_or_prev + 1 <= final_update_id
+                )
+                if not (bridges_snap or continues_seam):
+                    return self.on_gap(instrument, ts_event, ts_init), True
+            else:
+                if final_update_id <= snap_or_prev:
+                    return None, False
+                if first_update_id > snap_or_prev + 1:
+                    return self.on_gap(instrument, ts_event, ts_init), True
+            self.bridged = True
+            self.synced = True
+        else:
+            if final_update_id <= snap_or_prev:
+                return None, False
+            if market == Market.USDM:
+                if previous_final_update_id is not None:
+                    if previous_final_update_id != snap_or_prev:
+                        return self.on_gap(instrument, ts_event, ts_init), True
+                elif first_update_id > snap_or_prev + 1:
+                    return self.on_gap(instrument, ts_event, ts_init), True
+            elif first_update_id > snap_or_prev + 1:
                 return self.on_gap(instrument, ts_event, ts_init), True
-        elif first_update_id > self.last_update_id + 1:
-            return self.on_gap(instrument, ts_event, ts_init), True
 
         self.last_update_id = final_update_id
         p_dp = instrument.price_precision
@@ -812,8 +918,9 @@ def bmd_mark_price_to_nautilus(
     instrument: Any,
     *,
     delay_ns: int = 0,
+    funding_interval_minutes: int | None = None,
 ) -> tuple[Any, Any]:
-    """Convert BMD MarkPriceEvent -> (MarkPriceUpdate, FundingRateUpdate)."""
+    """Convert BMD MarkPriceEvent -> (MarkPriceUpdate, FundingRateUpdate) without inventing interval."""
     from nautilus_trader.model import FundingRateUpdate, MarkPriceUpdate, Price
 
     if ev.receive_time_utc_ns is None or ev.receive_time_utc_ns <= 0:
@@ -831,7 +938,7 @@ def bmd_mark_price_to_nautilus(
         rate=Decimal(ev.funding_rate),
         ts_event=ts_event,
         ts_init=ts_init,
-        interval=480,
+        interval=funding_interval_minutes,
         next_funding_ns=ev.next_funding_time_ms * 1_000_000,
     )
     return mp, fr
@@ -945,7 +1052,13 @@ def events_to_nautilus_data(
             if ev.receive_time_utc_ns is None or ev.receive_time_utc_ns <= 0:
                 continue
             bridge = bridges.setdefault(key, L2SequenceBridge())
-            ts_ev = ev.exchange_event_time_ms * 1_000_000 if ev.exchange_event_time_ms is not None else ev.receive_time_utc_ns
+            ts_ev, _ = resolve_event_ts_ns(
+                ev.market,
+                stream=Stream.DIFF_DEPTH,
+                receive_time_utc_ns=ev.receive_time_utc_ns,
+                exchange_event_time_ms=ev.exchange_event_time_ms,
+                exchange_transaction_time_ms=ev.exchange_transaction_time_ms,
+            )
             ts_in = ev.receive_time_utc_ns + delay_ns
             deltas, gap_hit = bridge.apply_depth_update(
                 market=ev.market,
@@ -964,7 +1077,7 @@ def events_to_nautilus_data(
             if gap_hit:
                 health_count += 1
                 data.append(
-                    bmd_health_to_instrument_status(
+                    bmd_health_to_stream_quality(
                         StreamHealthEvent(
                             venue=ev.venue,
                             market=ev.market,
@@ -974,7 +1087,6 @@ def events_to_nautilus_data(
                             reason="l2_sequence_gap",
                             observed_time_utc_ns=ev.receive_time_utc_ns,
                         ),
-                        inst,
                         delay_ns=delay_ns,
                     )
                 )
@@ -987,7 +1099,7 @@ def events_to_nautilus_data(
             health_count += 1
             if ev.stream == Stream.DIFF_DEPTH and ev.status in ("GAP", "STALE") and key in bridges:
                 data.append(bridges[key].on_gap(inst, ev.observed_time_utc_ns, ev.observed_time_utc_ns + delay_ns))
-            data.append(bmd_health_to_instrument_status(ev, inst, delay_ns=delay_ns))
+            data.append(bmd_health_to_stream_quality(ev, delay_ns=delay_ns))
     return NautilusConversionSummary(
         data=data,
         quote_provenance=quote_prov,
@@ -1006,6 +1118,7 @@ __all__ = [
     "bmd_agg_trade_to_trade_tick",
     "bmd_book_ticker_to_quote_tick",
     "bmd_health_to_instrument_status",
+    "bmd_health_to_stream_quality",
     "bmd_liquidation_to_custom_data",
     "bmd_mark_price_to_nautilus",
     "bmd_reference_to_custom_data",
@@ -1014,5 +1127,6 @@ __all__ = [
     "load_mcp_export_chunks",
     "load_partition_chunks",
     "read_recorder_events",
+    "resolve_event_ts_ns",
     "verify_sealed_zstd_artifact",
 ]

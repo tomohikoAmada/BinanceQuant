@@ -10,10 +10,12 @@ from nautilus_trader.model import CustomData, DataType
 BMD_LIQUIDATION_TYPE_NAME = "BmdLiquidation"
 BMD_REFERENCE_TYPE_NAME = "BmdReference"
 BMD_FACTOR_QUOTE_TYPE_NAME = "BmdFactorQuote"
+BMD_STREAM_QUALITY_TYPE_NAME = "BmdStreamQuality"
 
 BMD_LIQUIDATION_DATATYPE = DataType(BMD_LIQUIDATION_TYPE_NAME)
 BMD_REFERENCE_DATATYPE = DataType(BMD_REFERENCE_TYPE_NAME)
 BMD_FACTOR_QUOTE_DATATYPE = DataType(BMD_FACTOR_QUOTE_TYPE_NAME)
+BMD_STREAM_QUALITY_DATATYPE = DataType(BMD_STREAM_QUALITY_TYPE_NAME)
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +76,22 @@ class BmdFactorQuoteData:
     delivery_seq: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class BmdStreamQualityData:
+    """Per-stream feed quality event decoupled from exchange InstrumentStatus."""
+
+    market: str
+    symbol: str
+    stream: str
+    status: str
+    reason: str
+    observed_time_utc_ns: int
+    ts_event: int
+    ts_init: int
+    connection_generation: int | None = None
+    delivery_seq: int = 0
+
+
 def wrap_custom_data(data_type: DataType, payload: Any) -> CustomData:
     return CustomData(data_type, payload)
 
@@ -85,8 +103,11 @@ __all__ = [
     "BMD_LIQUIDATION_TYPE_NAME",
     "BMD_REFERENCE_DATATYPE",
     "BMD_REFERENCE_TYPE_NAME",
+    "BMD_STREAM_QUALITY_DATATYPE",
+    "BMD_STREAM_QUALITY_TYPE_NAME",
     "BmdFactorQuoteData",
     "BmdLiquidationData",
     "BmdReferenceData",
+    "BmdStreamQualityData",
     "wrap_custom_data",
 ]

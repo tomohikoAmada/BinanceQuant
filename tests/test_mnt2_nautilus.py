@@ -386,9 +386,13 @@ def test_multi_stream_conversion_and_l2_sequence_gap_recovery() -> None:
     assert len(deltas) == 4
     assert deltas[2].deltas[0].action == BookAction.CLEAR
 
-    statuses = [x for x in summary.data if isinstance(x, InstrumentStatus)]
-    assert len(statuses) == 1
-    assert not statuses[0].is_trading
+    quality_custom = [
+        x.data for x in summary.data if type(getattr(x, "data", None)).__name__ == "BmdStreamQualityData"
+    ]
+    assert len(quality_custom) == 1
+    assert quality_custom[0].stream == "diff_depth"
+    assert quality_custom[0].status == "GAP"
+    assert not any(isinstance(x, InstrumentStatus) for x in summary.data)
 
     mks = [x for x in summary.data if isinstance(x, MarkPriceUpdate)]
     frs = [x for x in summary.data if isinstance(x, FundingRateUpdate)]

@@ -171,7 +171,8 @@ def _build_verified_chunk_partition(
 
 
 def test_locked_nautilus_version_and_wheel_manifest() -> None:
-    assert version("nautilus_trader") == "2.0.0rc9"
+    installed_ver = version("nautilus_trader")
+    assert installed_ver in {"2.0.0rc9", "2.0.0rc9+bmd1"}
     wheels_json = json.loads((REPO_ROOT / "locks" / "nautilus-2.0.0rc9-wheels.json").read_text(encoding="utf-8"))
     assert wheels_json["version"] == "2.0.0rc9"
     assert wheels_json["commit"] == "da6b57aefdd62b44f675e434ffcfefca7f4025dd"

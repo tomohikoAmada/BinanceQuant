@@ -40,6 +40,7 @@ from nautilus_trader.trading import Strategy
 from bq_feed.events import BookTickerEvent, FeedEvent, Market, Stream
 from bq_feed.parity import ParityReport, compare_overlapping_windows
 
+from .custom_data import BMD_STREAM_QUALITY_DATATYPE, BmdStreamQualityData
 from .live import BmdDataClientFactory, BmdGatewayConfig
 
 VENUE = Venue("BINANCE")
@@ -107,7 +108,23 @@ class BtcSpotBboStrategy(Strategy):
     def on_start(self) -> None:
         route = ClientId(self._cfg.data_client_id) if self._cfg.data_client_id else None
         self.subscribe_instrument_status(self._cfg.instrument_id, client_id=route)
+        self.subscribe_data(BMD_STREAM_QUALITY_DATATYPE, client_id=route)
         self.subscribe_quotes(self._cfg.instrument_id, client_id=route)
+
+    def on_data(self, data: Any) -> None:
+        payload = getattr(data, "data", data)
+        if isinstance(payload, BmdStreamQualityData) and payload.stream == "book_ticker":
+            self.is_healthy = payload.status == "LIVE"
+            self.health_transitions.append(
+                {
+                    "stream": payload.stream,
+                    "is_trading": self.is_healthy,
+                    "status": payload.status,
+                    "reason": payload.reason,
+                    "ts_event": int(payload.ts_event),
+                    "ts_init": int(payload.ts_init),
+                }
+            )
 
     def on_instrument_status(self, status: Any) -> None:
         self.is_healthy = bool(status.is_trading)

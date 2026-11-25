@@ -322,10 +322,16 @@ impl TonicGatewayClient {
                     Payload::BookTicker(bt) => {
                         if let Some(meta) = bt.metadata {
                             let recv_ns = meta.receive_time_utc_ns.unwrap_or(read_ns);
-                            let ts_ev = meta
-                                .exchange_event_time_ms
-                                .map(|ms| (ms as u64) * 1_000_000)
-                                .unwrap_or(recv_ns);
+                            let ts_ev = if market != MARKET_SPOT {
+                                meta.exchange_transaction_time_ms
+                                    .or(meta.exchange_event_time_ms)
+                                    .map(|ms| (ms as u64) * 1_000_000)
+                                    .unwrap_or(recv_ns)
+                            } else {
+                                meta.exchange_event_time_ms
+                                    .map(|ms| (ms as u64) * 1_000_000)
+                                    .unwrap_or(recv_ns)
+                            };
                             let mut ev = TonicEvent::blank(KIND_BOOK_TICKER, inst_idx, stream_code);
                             ev.ts_event = ts_ev;
                             ev.gateway_recv_ns = recv_ns;
@@ -398,7 +404,13 @@ impl TonicGatewayClient {
                         let ts_ev = du
                             .metadata
                             .as_ref()
-                            .and_then(|m| m.exchange_event_time_ms)
+                            .and_then(|m| {
+                                if market != MARKET_SPOT {
+                                    m.exchange_transaction_time_ms.or(m.exchange_event_time_ms)
+                                } else {
+                                    m.exchange_event_time_ms
+                                }
+                            })
                             .map(|ms| (ms as u64) * 1_000_000)
                             .unwrap_or(recv_ns);
                         match l2.on_diff(
