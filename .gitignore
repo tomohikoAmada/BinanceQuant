@@ -11,3 +11,6 @@ runs/
 models/
 bq_workspace/
 .DS_Store
+rust_bmd_tonic/target/
+*.so
+*.dylib

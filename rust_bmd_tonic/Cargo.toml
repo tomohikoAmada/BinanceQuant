@@ -1,0 +1,20 @@
+[package]
+name = "bmd_tonic_ext"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "bmd_tonic_ext"
+crate-type = ["cdylib"]
+
+[dependencies]
+ahash = "0.8"
+crossbeam-channel = "0.5"
+prost = "0.13"
+pyo3 = { version = "0.23", features = ["extension-module"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+tonic = "0.12"
+
+[build-dependencies]
+protoc-bin-vendored = "3"
+tonic-build = "0.12"
