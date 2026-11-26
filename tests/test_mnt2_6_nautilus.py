@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -686,12 +688,14 @@ def test_bbo_t3_e9_recv12_causality_boundary() -> None:
     assert visible_at_10ms == [q0]
 
 
-def test_bmd1_fork_config_flags_and_validation() -> None:
-    """Verify 2.0.0rc9+bmd1 config flags when candidate wheel is installed."""
+def test_bmd2_candidate_fork_config_flags_and_validation() -> None:
+    """Assert 2.0.0rc9+bmd2 candidate version & fork flags by default (skip only when BQ_ALLOW_UPSTREAM_RC9=1)."""
     from importlib.metadata import version
 
-    if "bmd" not in version("nautilus_trader"):
-        pytest.skip("requires nautilus_trader 2.0.0rc9+bmd1 candidate wheel")
+    ver = version("nautilus_trader")
+    if os.environ.get("BQ_ALLOW_UPSTREAM_RC9") == "1" and "bmd" not in ver:
+        pytest.skip("BQ_ALLOW_UPSTREAM_RC9=1 set for upstream rc9 rollback compatibility job")
+    assert ver == "2.0.0rc9+bmd2"
 
     from nautilus_trader.adapters.binance import (
         BinanceDataClientConfig,
@@ -721,3 +725,139 @@ def test_bmd1_fork_config_flags_and_validation() -> None:
             product_type=BinanceProductType.USD_M,
             futures_diff_depth_interval_ms=333,
         )
+
+
+def test_provenance_depth_snapshot_unwrapping_and_usdm_strict_bridge(tmp_path: Path) -> None:
+    """Verify Recorder binance-public-rest-provenance.v1 snapshot decoding and strict USD-M L2 bridge."""
+    from bq_feed.events import OrderBookSnapshotEvent, ReferenceObservationEvent
+
+    snap_body = {"lastUpdateId": 100, "bids": [["61000.0", "2.0"]], "asks": [["61000.5", "3.0"]]}
+    env_b64 = {
+        "schema_version": "binance-public-rest-provenance.v1",
+        "representation": "http-body-base64.v1",
+        "source_stream": "depth_snapshot",
+        "request": {"parameters": {"symbol": "SOLUSDT"}},
+        "response": {
+            "status": 200,
+            "valid": True,
+            "raw_body_base64": base64.b64encode(json.dumps(snap_body).encode("utf-8")).decode("ascii"),
+        },
+    }
+    ev_b64 = parse_raw_record(
+        market=Market.USDM,
+        symbol="__GLOBAL__",
+        stream="rest_observations",
+        raw_payload=env_b64,
+        receive_time_utc_ns=1_700_000_000_000_000_000,
+        quality_flags=("rest_poll", "exact_rest_http_body_preserved", "depth_snapshot_pending"),
+    )
+    assert isinstance(ev_b64, OrderBookSnapshotEvent)
+    assert ev_b64.symbol == "SOLUSDT"
+    assert ev_b64.last_update_id == 100
+    assert len(ev_b64.bids) == 1 and len(ev_b64.asks) == 1
+
+    env_sdk = {
+        "schema_version": "binance-public-rest-provenance.v1",
+        "representation": "sdk-parsed-json.v1",
+        "source_stream": "depth_snapshot",
+        "request": {"parameters": {"symbol": "BTCUSDT"}},
+        "response": {"status": 200, "valid": True, "model": snap_body},
+    }
+    ev_sdk = parse_raw_record(
+        market=Market.SPOT,
+        symbol="__GLOBAL__",
+        stream="rest_observations",
+        raw_payload=env_sdk,
+        receive_time_utc_ns=1_700_000_000_000_000_000,
+    )
+    assert isinstance(ev_sdk, OrderBookSnapshotEvent) and ev_sdk.symbol == "BTCUSDT"
+
+    # Superseded / malformed / HTTP error snapshots MUST NOT become OrderBookSnapshotEvent
+    ev_bad = parse_raw_record(
+        market=Market.USDM,
+        symbol="SOLUSDT",
+        stream="rest_observations",
+        raw_payload=env_b64,
+        receive_time_utc_ns=1_700_000_000_000_000_000,
+        quality_flags=("depth_snapshot_superseded",),
+    )
+    assert isinstance(ev_bad, ReferenceObservationEvent) and ev_bad.status.startswith("INVALID:")
+
+    # Strict USD-M L2SequenceBridge counterexamples
+    inst = _usdm_inst("SOLUSDT")
+    side = [(Decimal("100.0"), Decimal("1.0"))]
+
+    # 1) First diff above snapshot (U=101, u=102, pu=100) for snapshot=100 MUST fail (GAP), not continue_seam!
+    b1 = L2SequenceBridge()
+    b1.apply_snapshot(instrument=inst, bids=side, asks=[], last_update_id=100, ts_event=1, ts_init=1)
+    d1, g1 = b1.apply_depth_update(
+        market=Market.USDM, instrument=inst, first_update_id=101, final_update_id=102, previous_final_update_id=100,
+        bids=side, asks=[], ts_event=2, ts_init=2,
+    )
+    assert g1 is True and b1.synced is False and d1.deltas[0].action == BookAction.CLEAR
+
+    # 2) Valid bridge (U=99, u=101, pu=98) followed by missing pu=None (U=102, u=103, pu=None) MUST GAP!
+    b2 = L2SequenceBridge()
+    b2.apply_snapshot(instrument=inst, bids=side, asks=[], last_update_id=100, ts_event=1, ts_init=1)
+    _, ok_g = b2.apply_depth_update(
+        market=Market.USDM, instrument=inst, first_update_id=99, final_update_id=101, previous_final_update_id=98,
+        bids=side, asks=[], ts_event=2, ts_init=2,
+    )
+    assert ok_g is False and b2.synced is True
+    d_miss_pu, g_miss_pu = b2.apply_depth_update(
+        market=Market.USDM, instrument=inst, first_update_id=102, final_update_id=103, previous_final_update_id=None,
+        bids=side, asks=[], ts_event=3, ts_init=3,
+    )
+    assert g_miss_pu is True and b2.synced is False and d_miss_pu.deltas[0].action == BookAction.CLEAR
+
+    # 3) Verified seam diff ending right on snapshot (U=95, u=100) links cleanly without double-applying, then pu=100 continues!
+    b3 = L2SequenceBridge()
+    b3.apply_snapshot(instrument=inst, bids=side, asks=[], last_update_id=100, ts_event=1, ts_init=1)
+    d_seam, g_seam = b3.apply_depth_update(
+        market=Market.USDM, instrument=inst, first_update_id=95, final_update_id=100, previous_final_update_id=94,
+        bids=side, asks=[], ts_event=2, ts_init=2,
+    )
+    assert g_seam is False and d_seam is None and b3.synced is True and b3.last_update_id == 100
+    d_next, g_next = b3.apply_depth_update(
+        market=Market.USDM, instrument=inst, first_update_id=101, final_update_id=102, previous_final_update_id=100,
+        bids=side, asks=[], ts_event=3, ts_init=3,
+    )
+    assert g_next is False and d_next is not None and b3.last_update_id == 102
+
+    # 4) Verify stream_filter={"orderbook"} resolves rest_observations Raw chunks containing depth_snapshot
+    if zstandard is not None:
+        export_root = tmp_path / "exp"
+        arch_root = tmp_path / "arch"
+        (arch_root / "raw").mkdir(parents=True)
+        rev_id = "20261126T000000Z-t"
+        part_id = "2026-11-26T1-usdm"
+        pdir = export_root / "revisions" / rev_id / "partitions" / part_id
+        pdir.mkdir(parents=True)
+        cid = "11111111-1111-1111-1111-111111111111"
+        raw_b, zst_b = _build_raw_v1_chunk_bytes(
+            chunk_id=cid, market="um_perpetual", symbol="__GLOBAL__", stream="rest_observations",
+            records=[(1_700_000_000_000_000_000, json.dumps(env_b64).encode("utf-8"), ())],
+        )
+        rel = "raw/snap.zst"
+        (arch_root / rel).write_bytes(zst_b)
+        row_line = json.dumps({
+            "chunk_id": cid, "ready": True, "market": "um_perpetual", "symbol": "__GLOBAL__", "stream": "rest_observations",
+            "storage_id": "a1", "target_relative_path": rel, "stored_bytes": len(zst_b),
+            "stored_sha256": _sha256_bytes(zst_b), "uncompressed_sha256": _sha256_bytes(raw_b),
+            "created_at_utc_ns": 1_700_000_000_000_000_000,
+            "receive_time_utc_range_ns": {"min": 1_700_000_000_000_000_000, "max": 1_700_000_000_000_000_000}, "gap": False,
+        })
+        cb = (row_line + "\n").encode("utf-8")
+        (pdir / "chunks.jsonl").write_bytes(cb)
+        m = {
+            "revision_id": rev_id,
+            "archive_targets": {"a1": {"local_path": str(arch_root)}},
+            "markets": {"usdm": {"active_roots": []}},
+            "partitions": [{"partition_id": part_id, "market": "usdm", "files": {"chunks_jsonl": {"url_path": f"export/revisions/{rev_id}/partitions/{part_id}/chunks.jsonl", "sha256": _sha256_bytes(cb)}}}],
+        }
+        (export_root / "revisions" / rev_id / "manifest.json").write_text(json.dumps(m), encoding="utf-8")
+        (export_root / "latest.json").write_text(json.dumps({"manifest_rel_path": f"revisions/{rev_id}/manifest.json"}), encoding="utf-8")
+        ob_chunks = load_mcp_export_chunks(export_root, market_filter={Market.USDM}, stream_filter={"orderbook"})
+        assert len(ob_chunks) == 1
+        ob_evs = read_recorder_events(ob_chunks, market_filter={Market.USDM}, symbol_filter={"SOLUSDT"}, stream_filter={"orderbook"})
+        assert len(ob_evs) == 1 and isinstance(ob_evs[0], OrderBookSnapshotEvent) and ob_evs[0].last_update_id == 100

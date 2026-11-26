@@ -96,6 +96,8 @@ class UsdmPerpAuditStrategyConfig(StrategyConfig):
         subscribe_funding: bool = True,
         subscribe_mark: bool = True,
         online: bool = False,
+        forbid_cross_zero_reversal: bool = False,
+        max_protection_retries: int = 2,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -114,6 +116,8 @@ class UsdmPerpAuditStrategyConfig(StrategyConfig):
         self.subscribe_funding = subscribe_funding
         self.subscribe_mark = subscribe_mark
         self.online = online
+        self.forbid_cross_zero_reversal = forbid_cross_zero_reversal
+        self.max_protection_retries = int(max_protection_retries)
 
 
 class UsdmPerpAuditStrategy(Strategy):
@@ -130,8 +134,17 @@ class UsdmPerpAuditStrategy(Strategy):
         self.fills: list[dict[str, Any]] = []
         self.order_events: list[dict[str, Any]] = []
         self.rejected_orders: list[dict[str, Any]] = []
+        self.blocked_risk_actions: list[dict[str, Any]] = []
         self.active_protection_client_id: Any = None
+        self.active_protection_side: OrderSide | None = None
         self.active_protection_qty: Decimal = Decimal(0)
+        self.protection_unconfirmed = False
+        self._protection_order_ids: set[str] = set()
+        self._pending_protection_id: str | None = None
+        self._canceling_protection_ids: set[str] = set()
+        self._seen_fill_keys: set[tuple[str, str, str]] = set()
+        self._protection_retries = 0
+        self._last_fill_px: Decimal | None = None
         self._last_quote_px: Decimal | None = None
         self._last_mark_px: Decimal | None = None
         self._entry_submitted = False
@@ -206,27 +219,135 @@ class UsdmPerpAuditStrategy(Strategy):
         dp = int(inst.size_precision)
         return Quantity.from_str(f"{qty:.{dp}f}")
 
-    def _ensure_protection_for_pos(self, ref_px: Decimal) -> None:
-        if self._cfg.protection_mode == "none" or self.net_pos == 0:
-            return
-        abs_pos = abs(self.net_pos)
-        if self.active_protection_client_id is not None:
-            if self._cfg.protection_mode == "close_position":
-                return
-            if self.active_protection_qty == abs_pos:
-                return
-            # Exposure changed (e.g. partial fill or add): cancel previous quantity stop before re-arming
-            old_order = self.cache.order(self.active_protection_client_id)
-            if old_order is not None and not old_order.is_closed:
-                route = self._route_exec()
-                if route is not None:
-                    self.cancel_order(old_order.client_order_id, client_id=route)
-                else:
-                    self.cancel_order(old_order.client_order_id)
+    def _reconciled_net_pos(self) -> Decimal:
+        """Compute signed net position from Nautilus cache positions when available, fallback to self.net_pos."""
+        open_positions = self.cache.positions_open(instrument_id=self._cfg.instrument_id)
+        if open_positions:
+            return sum((Decimal(str(p.signed_qty)) for p in open_positions), Decimal(0))
+        return self.net_pos
 
-        close_side = OrderSide.SELL if self.net_pos > 0 else OrderSide.BUY
+    def _cancel_order_routed(self, client_order_id: Any) -> None:
+        cid_str = str(client_order_id)
+        if cid_str in self._canceling_protection_ids:
+            return
+        self._canceling_protection_ids.add(cid_str)
+        route = self._route_exec()
+        if route is not None:
+            self.cancel_order(client_order_id, client_id=route)
+        else:
+            self.cancel_order(client_order_id)
+
+    def _live_protection_orders(self) -> list[Any]:
+        live: list[Any] = []
+        seen_ids: set[str] = set()
+        for o in self.cache.orders_open(instrument_id=self._cfg.instrument_id):
+            cid = str(o.client_order_id)
+            if cid in self._protection_order_ids and not o.is_closed and cid not in self._canceling_protection_ids:
+                live.append(o)
+                seen_ids.add(cid)
+        for cand_id in (self.active_protection_client_id, self._pending_protection_id):
+            if cand_id is None:
+                continue
+            cid = str(cand_id)
+            if cid in seen_ids or cid in self._canceling_protection_ids:
+                continue
+            o = self.cache.order(cand_id)
+            if o is not None and not o.is_closed:
+                live.append(o)
+                seen_ids.add(cid)
+        return live
+
+    def has_confirmed_protection(self) -> bool:
+        net_pos = self._reconciled_net_pos()
+        if self._cfg.protection_mode == "none" or net_pos == 0:
+            return True
+        if self._canceling_protection_ids or self._pending_protection_id is not None or self.protection_unconfirmed:
+            return False
+        want_side = OrderSide.SELL if net_pos > 0 else OrderSide.BUY
+        abs_pos = abs(net_pos)
+        if self.active_protection_client_id is None:
+            return False
+        order = self.cache.order(self.active_protection_client_id)
+        if order is None or order.is_closed or order.side != want_side:
+            return False
+        if self._cfg.protection_mode == "quantity_reduce_only" and Decimal(str(order.leaves_qty)) != abs_pos:
+            return False
+        return True
+
+    def _allow_entry_order(self, side: OrderSide, qty: Decimal, *, reduce_only: bool, kind: str) -> bool:
+        if self._shutting_down:
+            self.blocked_risk_actions.append({"reason": "SHUTTING_DOWN", "kind": kind, "qty": str(qty)})
+            return False
+        net_pos = self._reconciled_net_pos()
+        signed_delta = qty if side == OrderSide.BUY else -qty
+        new_pos = net_pos + signed_delta
+        is_pure_reduction = (
+            net_pos != 0
+            and ((net_pos > 0 and signed_delta < 0) or (net_pos < 0 and signed_delta > 0))
+            and abs(qty) <= abs(net_pos)
+        )
+        crosses_zero = net_pos != 0 and new_pos != 0 and (net_pos > 0) != (new_pos > 0)
+        if self._cfg.forbid_cross_zero_reversal and crosses_zero:
+            self.blocked_risk_actions.append({"reason": "FORBID_CROSS_ZERO_REVERSAL", "kind": kind, "qty": str(qty)})
+            return False
+        if reduce_only and (net_pos == 0 or not is_pure_reduction):
+            self.blocked_risk_actions.append({"reason": "INVALID_REDUCE_ONLY_DIRECTION_OR_QTY", "kind": kind, "qty": str(qty)})
+            return False
+        if not is_pure_reduction and net_pos != 0 and not self.has_confirmed_protection():
+            self.blocked_risk_actions.append({"reason": "UNCONFIRMED_PROTECTION_BLOCKS_ADD", "kind": kind, "qty": str(qty)})
+            return False
+        return True
+
+    def _ensure_protection_for_pos(self, ref_px: Decimal) -> None:
+        if self._cfg.protection_mode == "none":
+            return
+        net_pos = self._reconciled_net_pos()
+        self.net_pos = net_pos
+
+        live_orders = self._live_protection_orders()
+        if net_pos == 0:
+            for o in live_orders:
+                self._cancel_order_routed(o.client_order_id)
+            self.active_protection_client_id = None
+            self.active_protection_side = None
+            self.active_protection_qty = Decimal(0)
+            self._pending_protection_id = None
+            self.protection_unconfirmed = False
+            return
+
+        abs_pos = abs(net_pos)
+        want_side = OrderSide.SELL if net_pos > 0 else OrderSide.BUY
+
+        matched: Any = None
+        for o in live_orders:
+            leaves = Decimal(str(o.leaves_qty))
+            side_ok = o.side == want_side
+            qty_ok = self._cfg.protection_mode == "close_position" or leaves == abs_pos
+            if side_ok and qty_ok and matched is None and str(o.client_order_id) != self._pending_protection_id:
+                matched = o
+            elif str(o.client_order_id) == self._pending_protection_id and side_ok and qty_ok:
+                # Existing in-flight submission already matches desired protection
+                return
+            else:
+                self._cancel_order_routed(o.client_order_id)
+
+        if matched is not None and not self._canceling_protection_ids:
+            self.active_protection_client_id = matched.client_order_id
+            self.active_protection_side = want_side
+            self.active_protection_qty = abs_pos
+            self.protection_unconfirmed = False
+            return
+
+        # Defer replacing canceled stale protection until cancel finishes cleanly
+        if self._canceling_protection_ids:
+            self.active_protection_client_id = None
+            self.active_protection_side = None
+            self.active_protection_qty = Decimal(0)
+            self.protection_unconfirmed = True
+            return
+
         dist = Decimal(self._cfg.stop_distance_pct)
-        trig_raw = ref_px * (Decimal(1) - dist) if self.net_pos > 0 else ref_px * (Decimal(1) + dist)
+        trig_raw = ref_px * (Decimal(1) - dist) if net_pos > 0 else ref_px * (Decimal(1) + dist)
         trig_px = self._quantize_price(trig_raw)
         trig_type = (
             TriggerType.MARK_PRICE
@@ -235,19 +356,25 @@ class UsdmPerpAuditStrategy(Strategy):
         )
         stop_order = self.order_factory.stop_market(
             self._cfg.instrument_id,
-            close_side,
+            want_side,
             self._quantize_qty(abs_pos),
             trig_px,
             trigger_type=trig_type,
             reduce_only=True,
         )
         params = {"close_position": True} if self._cfg.protection_mode == "close_position" else None
-        self.active_protection_client_id = stop_order.client_order_id
-        self.active_protection_qty = abs_pos
+        cid_str = str(stop_order.client_order_id)
+        self._protection_order_ids.add(cid_str)
+        self._pending_protection_id = cid_str
+        self.active_protection_client_id = None
+        self.active_protection_side = None
+        self.active_protection_qty = Decimal(0)
+        self.protection_unconfirmed = True
         self.intents.append(
             {
                 "kind": f"protection_{self._cfg.protection_mode}",
-                "side": "SELL" if close_side == OrderSide.SELL else "BUY",
+                "client_order_id": cid_str,
+                "side": "SELL" if want_side == OrderSide.SELL else "BUY",
                 "qty": str(abs_pos),
                 "trigger_price": str(trig_px),
                 "working_type": self._cfg.working_type,
@@ -265,9 +392,11 @@ class UsdmPerpAuditStrategy(Strategy):
 
         if self._cfg.entry_mode == "market_on_first_quote":
             if not self._entry_submitted:
-                self._entry_submitted = True
                 side = OrderSide.BUY if self._cfg.side == "BUY" else OrderSide.SELL
                 qty = Decimal(self._cfg.order_qty)
+                if not self._allow_entry_order(side, qty, reduce_only=False, kind="entry_market"):
+                    return
+                self._entry_submitted = True
                 order = self.order_factory.market(
                     self._cfg.instrument_id,
                     side,
@@ -299,6 +428,8 @@ class UsdmPerpAuditStrategy(Strategy):
                 side = OrderSide.BUY if s_str == "BUY" else OrderSide.SELL
                 qty = Decimal(str(act["qty"]))
                 reduce_only = bool(act.get("reduce_only", False))
+                if not self._allow_entry_order(side, qty, reduce_only=reduce_only, kind="scripted_market"):
+                    continue
                 order = self.order_factory.market(
                     self._cfg.instrument_id,
                     side,
@@ -327,25 +458,98 @@ class UsdmPerpAuditStrategy(Strategy):
             }
         )
 
+    def on_order_accepted(self, event: Any) -> None:
+        cid = str(event.client_order_id)
+        if cid in self._protection_order_ids:
+            order = self.cache.order(event.client_order_id)
+            net_pos = self._reconciled_net_pos()
+            want_side = OrderSide.SELL if net_pos > 0 else OrderSide.BUY
+            if (
+                net_pos == 0
+                or order is None
+                or order.is_closed
+                or order.side != want_side
+                or (self._cfg.protection_mode == "quantity_reduce_only" and Decimal(str(order.leaves_qty)) != abs(net_pos))
+            ):
+                # Position changed while stop submission was in flight -> cancel immediately!
+                self._pending_protection_id = None
+                self._cancel_order_routed(event.client_order_id)
+                return
+            self.active_protection_client_id = event.client_order_id
+            self.active_protection_side = order.side
+            self.active_protection_qty = abs(net_pos)
+            self._pending_protection_id = None
+            self.protection_unconfirmed = False
+            self._protection_retries = 0
+
+    def on_order_canceled(self, event: Any) -> None:
+        cid = str(event.client_order_id)
+        self._canceling_protection_ids.discard(cid)
+        if cid == self._pending_protection_id:
+            self._pending_protection_id = None
+        if cid == str(self.active_protection_client_id):
+            self.active_protection_client_id = None
+            self.active_protection_side = None
+            self.active_protection_qty = Decimal(0)
+        if (
+            cid in self._protection_order_ids
+            and not self._shutting_down
+            and not self._canceling_protection_ids
+            and self._reconciled_net_pos() != 0
+            and not self.has_confirmed_protection()
+        ):
+            ref = self._last_fill_px or self._last_quote_px or self._last_mark_px
+            if ref is not None:
+                self._ensure_protection_for_pos(ref)
+
     def on_order_rejected(self, event: Any) -> None:
+        cid = str(event.client_order_id)
         self.rejected_orders.append(
             {
-                "client_order_id": str(event.client_order_id),
+                "client_order_id": cid,
                 "reason": str(getattr(event, "reason", "")),
                 "ts_event": int(event.ts_event),
             }
         )
+        self._canceling_protection_ids.discard(cid)
+        if cid == self._pending_protection_id:
+            self._pending_protection_id = None
+        if cid == str(self.active_protection_client_id):
+            self.active_protection_client_id = None
+            self.active_protection_side = None
+            self.active_protection_qty = Decimal(0)
+        if cid in self._protection_order_ids:
+            self.protection_unconfirmed = True
+            if (
+                not self._shutting_down
+                and self._reconciled_net_pos() != 0
+                and self._protection_retries < self._cfg.max_protection_retries
+            ):
+                self._protection_retries += 1
+                ref = self._last_fill_px or self._last_quote_px or self._last_mark_px
+                if ref is not None:
+                    self._ensure_protection_for_pos(ref)
 
     def on_order_filled(self, event: Any) -> None:
+        cid = str(event.client_order_id)
+        vid = str(getattr(event, "venue_order_id", ""))
+        tid = str(getattr(event, "trade_id", ""))
+        fkey = (cid, vid, tid)
+        if tid and fkey in self._seen_fill_keys:
+            return
+        if tid:
+            self._seen_fill_keys.add(fkey)
+
         side = "BUY" if "BUY" in str(event.order_side) else "SELL"
         qty = Decimal(str(event.last_qty))
         px = Decimal(str(event.last_px))
         self.net_pos += qty if side == "BUY" else -qty
+        self._last_fill_px = px
         self.fills.append(
             {
-                "client_order_id": str(event.client_order_id),
-                "venue_order_id": str(getattr(event, "venue_order_id", "")),
-                "trade_id": str(getattr(event, "trade_id", "")),
+                "client_order_id": cid,
+                "venue_order_id": vid,
+                "trade_id": tid,
                 "side": side,
                 "qty": str(qty),
                 "px": str(px),
@@ -354,11 +558,16 @@ class UsdmPerpAuditStrategy(Strategy):
                 "ts_init": int(event.ts_init),
             }
         )
-        if str(event.client_order_id) == str(self.active_protection_client_id) or self.net_pos == 0:
-            if self.net_pos == 0:
-                self.active_protection_client_id = None
-                self.active_protection_qty = Decimal(0)
-        elif self.net_pos != 0:
+        if cid in self._protection_order_ids:
+            order = self.cache.order(event.client_order_id)
+            if order is None or order.is_closed:
+                if cid == str(self.active_protection_client_id):
+                    self.active_protection_client_id = None
+                    self.active_protection_side = None
+                    self.active_protection_qty = Decimal(0)
+                if cid == self._pending_protection_id:
+                    self._pending_protection_id = None
+        if not self._shutting_down:
             self._ensure_protection_for_pos(px)
 
 
@@ -449,6 +658,9 @@ def run_usdm_backtest(
             "positions": pos_summary,
             "callbacks_count": strat.callbacks_count,
             "net_pos": str(strat.net_pos),
+            "blocked_risk_actions": strat.blocked_risk_actions,
+            "has_confirmed_protection": strat.has_confirmed_protection(),
+            "protection_unconfirmed": strat.protection_unconfirmed,
         }
     finally:
         engine.dispose()

@@ -28,6 +28,7 @@ from bq_nautilus.instruments import (  # noqa: E402
     SUPPORTED_BMD_SYMBOLS,
     compute_tiered_maintenance_margin,
     fetch_binance_exchange_info_specs,
+    spec_from_exchange_info_entry,
 )
 from bq_nautilus.usdm_accounting import (  # noqa: E402
     IsolatedUsdmLedger,
@@ -163,16 +164,122 @@ def run_public_specs_suite() -> dict[str, Any]:
     }
 
 
+_PINNED_SOLUSDT_EXCHANGE_INFO = {
+    "symbol": "SOLUSDT",
+    "contractType": "PERPETUAL",
+    "status": "TRADING",
+    "baseAsset": "SOL",
+    "quoteAsset": "USDT",
+    "marginAsset": "USDT",
+    "maintMarginPercent": "2.5000",
+    "requiredMarginPercent": "5.0000",
+    "filters": [
+        {"filterType": "PRICE_FILTER", "minPrice": "0.01", "maxPrice": "1000000", "tickSize": "0.01"},
+        {"filterType": "LOT_SIZE", "minQty": "0.01", "maxQty": "1000000", "stepSize": "0.01"},
+        {"filterType": "MARKET_LOT_SIZE", "minQty": "0.01", "maxQty": "6000", "stepSize": "0.01"},
+        {"filterType": "MIN_NOTIONAL", "notional": "5"},
+    ],
+}
+
+
 def run_accounting_parity_suite() -> dict[str, Any]:
-    """Run exhaustive Decimal isolated ledger vs Nautilus BacktestEngine parity checks."""
+    """Run strictly offline Decimal isolated ledger vs Nautilus BacktestEngine parity checks."""
     from nautilus_trader.model import AggressorSide, FundingRateUpdate, InstrumentId, MarkPriceUpdate, Price, Quantity, QuoteTick, TradeId, TradeTick
 
-    sol_spec = fetch_binance_exchange_info_specs(market=Market.USDM, symbols=("SOLUSDT",), demo=False)["SOLUSDT"]
+    raw_spec_bytes = json.dumps(_PINNED_SOLUSDT_EXCHANGE_INFO, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    spec_sha256 = hashlib.sha256(raw_spec_bytes).hexdigest()
+    sol_spec = spec_from_exchange_info_entry(
+        _PINNED_SOLUSDT_EXCHANGE_INFO,
+        market=Market.USDM,
+        observe_time_utc_ns=1_700_000_000_000_000_000,
+        source_time_ms=1_700_000_000_000,
+        source="pinned_offline_solusdt_fixture",
+    )
     sol_id = InstrumentId.from_str("SOLUSDT-PERP.BINANCE")
     t0 = 1_700_000_000_000_000_000
     t_b1 = t0 + 10_000_000_000
 
-    # 1. Funding + Stop Protection Parity (SOLUSDT 50 USDT 5x)
+    # 1a. MARK_PRICE trigger vs visible L1 book fill separation (LONG):
+    # Book moves to 146.80/146.90, then MarkPrice=146.90 crosses stop trigger (147.00).
+    # Independent expected exit fill MUST be L1 best bid 146.80 (NOT mark 146.90) -> 48.94748000 USDT!
+    expected_mark_long_exit_px = Decimal("146.80")
+    expected_mark_long_final = Decimal("48.94748000")
+    data_mark_long = [
+        QuoteTick(sol_id, Price.from_str("150.00"), Price.from_str("150.00"), Quantity.from_str("100.00"), Quantity.from_str("100.00"), t0, t0),
+        MarkPriceUpdate(sol_id, Price.from_str("150.00"), t0 + 1_000_000, t0 + 1_000_000),
+        FundingRateUpdate(sol_id, Decimal("0.001"), t0 + 2_000_000, t0 + 2_000_000, interval=None, next_funding_ns=t_b1),
+        MarkPriceUpdate(sol_id, Price.from_str("160.00"), t_b1 - 1_000_000, t_b1 - 1_000_000),
+        QuoteTick(sol_id, Price.from_str("146.80"), Price.from_str("146.90"), Quantity.from_str("100.00"), Quantity.from_str("100.00"), t_b1 + 1_000_000_000, t_b1 + 1_000_000_000),
+        MarkPriceUpdate(sol_id, Price.from_str("146.90"), t_b1 + 1_000_000_100, t_b1 + 1_000_000_100),
+    ]
+    bt_mark_long = run_usdm_backtest(
+        spec=sol_spec,
+        data=data_mark_long,
+        strategy_config=UsdmPerpAuditStrategyConfig(
+            instrument_id=sol_id,
+            allowed_symbol="SOLUSDT",
+            leverage=5,
+            order_qty="0.30",
+            side="BUY",
+            protection_mode="quantity_reduce_only",
+            working_type="MARK_PRICE",
+            stop_distance_pct="0.02",
+        ),
+        starting_usdt=Decimal("50"),
+        leverage=5,
+    )
+    hand_mark_long = IsolatedUsdmLedger(symbol="SOLUSDT", cross_wallet_usdt=Decimal("50"), leverage=5)
+    hand_mark_long.apply_fill(ts_ns=t0, order_id="e1", side="BUY", qty=Decimal("0.30"), price=Decimal("150.00"), fee_amount=Decimal("0.0225"))
+    hand_mark_long.settle_funding(funding_time_ns=t_b1, settled_rate=Decimal("0.001"), settlement_mark_price=Decimal("160.00"), visible_utc_ns=t_b1)
+    hand_mark_long.apply_fill(
+        ts_ns=t_b1 + 1_000_000_100,
+        order_id="e2",
+        side="SELL",
+        qty=Decimal("0.30"),
+        price=expected_mark_long_exit_px,
+        fee_amount=Decimal("0.30") * expected_mark_long_exit_px * Decimal("0.0005"),
+    )
+    mark_long_diff = abs(Decimal(bt_mark_long["final_total_usdt"]) - hand_mark_long.cross_wallet_usdt)
+
+    # 1b. Short-side MARK_PRICE protection separation:
+    # Sell 0.30 @ 150.00 -> Book 153.10/153.20 -> Mark 153.10 triggers BUY stop (153.00) -> fills at L1 ask 153.20!
+    expected_mark_short_exit_px = Decimal("153.20")
+    data_mark_short = [
+        QuoteTick(sol_id, Price.from_str("150.00"), Price.from_str("150.00"), Quantity.from_str("100.00"), Quantity.from_str("100.00"), t0, t0),
+        MarkPriceUpdate(sol_id, Price.from_str("150.00"), t0 + 1_000_000, t0 + 1_000_000),
+        QuoteTick(sol_id, Price.from_str("153.10"), Price.from_str("153.20"), Quantity.from_str("100.00"), Quantity.from_str("100.00"), t0 + 2_000_000_000, t0 + 2_000_000_000),
+        MarkPriceUpdate(sol_id, Price.from_str("153.10"), t0 + 2_000_000_100, t0 + 2_000_000_100),
+    ]
+    bt_mark_short = run_usdm_backtest(
+        spec=sol_spec,
+        data=data_mark_short,
+        strategy_config=UsdmPerpAuditStrategyConfig(
+            instrument_id=sol_id,
+            allowed_symbol="SOLUSDT",
+            leverage=5,
+            order_qty="0.30",
+            side="SELL",
+            protection_mode="quantity_reduce_only",
+            working_type="MARK_PRICE",
+            stop_distance_pct="0.02",
+        ),
+        starting_usdt=Decimal("50"),
+        leverage=5,
+    )
+    hand_mark_short = IsolatedUsdmLedger(symbol="SOLUSDT", cross_wallet_usdt=Decimal("50"), leverage=5)
+    hand_mark_short.apply_fill(ts_ns=t0, order_id="s1", side="SELL", qty=Decimal("0.30"), price=Decimal("150.00"), fee_amount=Decimal("0.0225"))
+    hand_mark_short.apply_fill(
+        ts_ns=t0 + 2_000_000_100,
+        order_id="s2",
+        side="BUY",
+        qty=Decimal("0.30"),
+        price=expected_mark_short_exit_px,
+        fee_amount=Decimal("0.30") * expected_mark_short_exit_px * Decimal("0.0005"),
+    )
+    mark_short_diff = abs(Decimal(bt_mark_short["final_total_usdt"]) - hand_mark_short.cross_wallet_usdt)
+
+    # 1c. CONTRACT_PRICE TradeTick trigger parity (TradeTick updates simulated L1 quote in L1_MBP -> expected 146.90)
+    expected_contract_exit_px = Decimal("146.90")
     data_prot = [
         QuoteTick(sol_id, Price.from_str("150.00"), Price.from_str("150.00"), Quantity.from_str("100.00"), Quantity.from_str("100.00"), t0, t0),
         MarkPriceUpdate(sol_id, Price.from_str("150.00"), t0 + 1_000_000, t0 + 1_000_000),
@@ -200,12 +307,17 @@ def run_accounting_parity_suite() -> dict[str, Any]:
     hand = IsolatedUsdmLedger(symbol="SOLUSDT", cross_wallet_usdt=Decimal("50"), leverage=5)
     hand.apply_fill(ts_ns=t0, order_id="e1", side="BUY", qty=Decimal("0.30"), price=Decimal("150.00"), fee_amount=Decimal("0.0225"))
     hand.settle_funding(funding_time_ns=t_b1, settled_rate=Decimal("0.001"), settlement_mark_price=Decimal("160.00"), visible_utc_ns=t_b1)
-    exit_px = Decimal(bt_prot["fills"][1]["px"])
-    hand.apply_fill(ts_ns=t_b1 + 1_000_000_100, order_id="e2", side="SELL", qty=Decimal("0.30"), price=exit_px, fee_amount=Decimal("0.30") * exit_px * Decimal("0.0005"))
+    hand.apply_fill(
+        ts_ns=t_b1 + 1_000_000_100,
+        order_id="e2",
+        side="SELL",
+        qty=Decimal("0.30"),
+        price=expected_contract_exit_px,
+        fee_amount=Decimal("0.30") * expected_contract_exit_px * Decimal("0.0005"),
+    )
     prot_diff = abs(Decimal(bt_prot["final_total_usdt"]) - hand.cross_wallet_usdt)
 
-    # 2. All-in 50 USDT 5x Isolated Liquidation Jump-Through-Protection Parity
-    # Open 1.00 SOL @ 150 (30 USDT IM, 50 USDT total isolated wallet), gap quote + mark to 100.00!
+    # 2. All-in 50 USDT 5x Isolated Liquidation Jump-Through-Protection Parity (strictly pre & post snapshot!)
     data_liq = [
         QuoteTick(sol_id, Price.from_str("150.00"), Price.from_str("150.00"), Quantity.from_str("100.00"), Quantity.from_str("100.00"), t0, t0),
         MarkPriceUpdate(sol_id, Price.from_str("150.00"), t0 + 1_000_000, t0 + 1_000_000),
@@ -234,18 +346,99 @@ def run_accounting_parity_suite() -> dict[str, Any]:
     liq_res = hand_liq.evaluate_mark_and_liquidation(ts_ns=t0 + 2_000_000_000, mark_price=Decimal("100.00"), protection_trigger_price=Decimal("147.00"))
 
     # 3. Partial-capital isolated comparison (20 USDT isolated inside 50 USDT total account)
-    # Demonstrates why IsolatedUsdmLedger strictly protects cross_wallet_usdt=30 whereas Nautilus MarginAccount uses total_equity!
     hand_partial_iso = IsolatedUsdmLedger(symbol="SOLUSDT", cross_wallet_usdt=Decimal("30"), isolated_wallet_usdt=Decimal("20"), leverage=5, auto_allocate_isolated=False)
     hand_partial_iso.apply_fill(ts_ns=t0, order_id="p1", side="BUY", qty=Decimal("1.00"), price=Decimal("100.00"), fee_amount=Decimal("0.05"))
     liq_partial = hand_partial_iso.evaluate_mark_and_liquidation(ts_ns=t0 + 1_000, mark_price=Decimal("78.00"), protection_trigger_price=Decimal("90.00"))
 
+    # 4. Equal-qty reversal protection parity (quantity_reduce_only & close_position)
+    rev_results: dict[str, Any] = {}
+    for pmode in ("quantity_reduce_only", "close_position"):
+        bt_rev = run_usdm_backtest(
+            spec=sol_spec,
+            data=[
+                QuoteTick(sol_id, Price.from_str("100.00"), Price.from_str("100.01"), Quantity.from_str("10.00"), Quantity.from_str("10.00"), t0, t0),
+                MarkPriceUpdate(sol_id, Price.from_str("100.00"), t0 + 1, t0 + 1),
+                QuoteTick(sol_id, Price.from_str("105.00"), Price.from_str("105.01"), Quantity.from_str("10.00"), Quantity.from_str("10.00"), t0 + 1_000_000_000, t0 + 1_000_000_000),
+                MarkPriceUpdate(sol_id, Price.from_str("105.00"), t0 + 1_000_000_001, t0 + 1_000_000_001),
+                QuoteTick(sol_id, Price.from_str("120.00"), Price.from_str("120.01"), Quantity.from_str("10.00"), Quantity.from_str("10.00"), t0 + 2_000_000_000, t0 + 2_000_000_000),
+                MarkPriceUpdate(sol_id, Price.from_str("120.00"), t0 + 2_000_000_001, t0 + 2_000_000_001),
+            ],
+            strategy_config=UsdmPerpAuditStrategyConfig(
+                instrument_id=sol_id,
+                protection_mode=pmode,
+                working_type="MARK_PRICE",
+                entry_mode="plan_scripted",
+                stop_distance_pct="0.02",
+                scripted_actions=(
+                    {"callback": 1, "side": "BUY", "qty": "0.20"},
+                    {"callback": 2, "side": "SELL", "qty": "0.40"},
+                ),
+            ),
+            starting_usdt=Decimal("50"),
+            leverage=5,
+            liquidation_enabled=False,
+        )
+        rev_results[pmode] = {
+            "net_pos": bt_rev["net_pos"],
+            "fills_count": len(bt_rev["fills"]),
+            "last_fill_side": bt_rev["fills"][-1]["side"] if bt_rev["fills"] else None,
+            "last_fill_px": bt_rev["fills"][-1]["px"] if bt_rev["fills"] else None,
+            "ok": Decimal(bt_rev["net_pos"]) == 0 and len(bt_rev["fills"]) == 3 and bt_rev["fills"][-1]["side"] == "BUY",
+        }
+
+    checks = {
+        "mark_long_fill_at_bid": (
+            len(bt_mark_long["fills"]) == 2
+            and Decimal(bt_mark_long["fills"][1]["px"]) == expected_mark_long_exit_px
+            and Decimal(bt_mark_long["final_total_usdt"]) == expected_mark_long_final
+            and mark_long_diff == 0
+        ),
+        "mark_short_fill_at_ask": (
+            len(bt_mark_short["fills"]) == 2
+            and Decimal(bt_mark_short["fills"][1]["px"]) == expected_mark_short_exit_px
+            and mark_short_diff == 0
+        ),
+        "contract_trade_trigger": (
+            len(bt_prot["fills"]) == 2
+            and Decimal(bt_prot["fills"][1]["px"]) == expected_contract_exit_px
+            and prot_diff == 0
+        ),
+        "liquidation_snapshot_consistent": (
+            liq_res.triggered
+            and liq_res.jumped_through_protection
+            and liq_res.position_qty == Decimal("1.00")
+            and liq_res.isolated_wallet_usdt == Decimal("49.925")
+            and liq_res.post_position_qty == Decimal(0)
+            and liq_res.post_isolated_wallet_usdt == Decimal(0)
+            and hand_partial_iso.cross_wallet_usdt == Decimal("30")
+            and liq_partial.triggered
+        ),
+        "reversal_protection": all(v["ok"] for v in rev_results.values()),
+    }
+
     return {
         "suite": "accounting-parity",
+        "offline_spec_fixture_sha256": spec_sha256,
+        "mark_trigger_vs_book_fill_long": {
+            "expected_exit_px": str(expected_mark_long_exit_px),
+            "observed_exit_px": bt_mark_long["fills"][1]["px"] if len(bt_mark_long["fills"]) >= 2 else None,
+            "nautilus_final_usdt": bt_mark_long["final_total_usdt"],
+            "hand_ledger_final_usdt": str(hand_mark_long.cross_wallet_usdt),
+            "abs_diff_usdt": str(mark_long_diff),
+        },
+        "mark_trigger_vs_book_fill_short": {
+            "expected_exit_px": str(expected_mark_short_exit_px),
+            "observed_exit_px": bt_mark_short["fills"][1]["px"] if len(bt_mark_short["fills"]) >= 2 else None,
+            "nautilus_final_usdt": bt_mark_short["final_total_usdt"],
+            "hand_ledger_final_usdt": str(hand_mark_short.cross_wallet_usdt),
+            "abs_diff_usdt": str(mark_short_diff),
+        },
         "funding_and_stop_protection": {
+            "expected_exit_px": str(expected_contract_exit_px),
             "nautilus_final_usdt": bt_prot["final_total_usdt"],
             "hand_ledger_final_usdt": str(hand.cross_wallet_usdt),
             "abs_diff_usdt": str(prot_diff),
-            "exact_match": prot_diff < Decimal("0.00000005"),
+            "exact_match": prot_diff == 0,
             "fills": bt_prot["fills"],
         },
         "all_in_gap_liquidation": {
@@ -253,6 +446,10 @@ def run_accounting_parity_suite() -> dict[str, Any]:
             "nautilus_fills": bt_liq["fills"],
             "isolated_ledger_triggered": liq_res.triggered,
             "jumped_through_protection": liq_res.jumped_through_protection,
+            "pre_liq_position_qty": str(liq_res.position_qty),
+            "pre_liq_isolated_wallet_usdt": str(liq_res.isolated_wallet_usdt),
+            "post_liq_position_qty": str(liq_res.post_position_qty),
+            "post_liq_isolated_wallet_usdt": str(liq_res.post_isolated_wallet_usdt),
             "liquidation_price": str(liq_res.liquidation_price),
             "bankruptcy_price": str(liq_res.bankruptcy_price),
             "sensitivity_band_usdt": liq_res.sensitivity_band_usdt,
@@ -266,7 +463,9 @@ def run_accounting_parity_suite() -> dict[str, Any]:
             "sensitivity_band_usdt": liq_partial.sensitivity_band_usdt,
             "boundary_note": "Out-of-scope multi-symbol cross/partial isolated sharing remains disabled until per-position isolated collateral is modeled natively.",
         },
-        "status": "PASSED",
+        "reversal_protection": rev_results,
+        "checks": checks,
+        "status": "PASSED" if all(checks.values()) else "FAILED",
     }
 
 
@@ -1176,10 +1375,31 @@ def run_live_demo_suite(*, symbol: str = "SOLUSDT") -> dict[str, Any]:
             "reason": "BINANCE_DEMO_API_KEY and BINANCE_DEMO_API_SECRET are not set in environment; execution remains disabled per M-NT3 gate.",
         }
 
-    # Verify one-way mode, set ISOLATED margin & 5x leverage, inspect leverageBracket + income
+    # Read-only preflight: never mutate account dual-side mode or touch foreign orders/positions
     dual = client.request("GET", "/fapi/v1/positionSide/dual")
     if dual.get("dualSidePosition"):
-        client.request("POST", "/fapi/v1/positionSide/dual", params={"dualSidePosition": False})
+        return {
+            "suite": "live-demo",
+            "symbol": symbol,
+            "status": "BLOCKED_ACCOUNT_NOT_ONE_WAY",
+            "execution_enabled": False,
+            "reason": "Demo account has dualSidePosition=true; dedicated one-way account required without mutating shared mode.",
+        }
+    pre_oo = client.request("GET", "/fapi/v1/openOrders", params={"symbol": symbol})
+    pre_oa = client.request("GET", "/fapi/v1/openAlgoOrders", params={"symbol": symbol})
+    pre_pos = client.request("GET", "/fapi/v2/positionRisk", params={"symbol": symbol})
+    pre_nonzero_pos = [p for p in pre_pos if Decimal(str(p.get("positionAmt", "0"))) != 0]
+    if pre_oo or pre_oa or pre_nonzero_pos:
+        return {
+            "suite": "live-demo",
+            "symbol": symbol,
+            "status": "BLOCKED_FOREIGN_STATE_PRESENT",
+            "execution_enabled": False,
+            "pre_open_orders": len(pre_oo),
+            "pre_open_algos": len(pre_oa),
+            "pre_positions": pre_nonzero_pos,
+            "reason": "Refusing to wipe foreign orders/positions on symbol before dedicated Demo verification.",
+        }
     try:
         client.request("POST", "/fapi/v1/marginType", params={"symbol": symbol, "marginType": "ISOLATED"})
     except RuntimeError as exc:
@@ -1201,6 +1421,9 @@ def run_live_demo_suite(*, symbol: str = "SOLUSDT") -> dict[str, Any]:
     t_start_ms = int(time.time() * 1000) - 2000
     qty = "0.20" if symbol == "SOLUSDT" else "0.01"
     half_qty = "0.10" if symbol == "SOLUSDT" else "0.01"
+    created_order_ids: set[int] = set()
+    created_algo_ids: set[int] = set()
+    created_client_ids: set[str] = set()
 
     # Negative mutual-exclusion test against real demo-fapi: closePosition=true + quantity MUST fail!
     close_pos_mutex_rejected = False
@@ -1243,17 +1466,23 @@ def run_live_demo_suite(*, symbol: str = "SOLUSDT") -> dict[str, Any]:
         last_px = Decimal(str(ticker["price"]))
 
         # Open 0.20 SOL MARKET BUY
+        entry_cid = f"mnt3e{int(time.time() * 1000) % 1000000}"
+        created_client_ids.add(entry_cid)
         entry = client.request(
             "POST",
             "/fapi/v1/order",
-            params={"symbol": symbol, "side": "BUY", "type": "MARKET", "quantity": qty, "newOrderRespType": "RESULT"},
+            params={"symbol": symbol, "side": "BUY", "type": "MARKET", "quantity": qty, "newClientOrderId": entry_cid, "newOrderRespType": "RESULT"},
         )
+        if entry.get("orderId"):
+            created_order_ids.add(int(entry["orderId"]))
         pos_mid = client.request("GET", "/fapi/v2/positionRisk", params={"symbol": symbol})
 
         stop_px = f"{(mark_px * Decimal('0.90')):.2f}"
         cp_px = f"{(mark_px * Decimal('0.89')):.2f}"
 
         # 1. Quantity reduceOnly algoOrder with MARK_PRICE
+        q_cid = f"mnt3q{int(time.time())}"
+        created_client_ids.add(q_cid)
         algo_qty = client.request(
             "POST",
             "/fapi/v1/algoOrder",
@@ -1266,12 +1495,16 @@ def run_live_demo_suite(*, symbol: str = "SOLUSDT") -> dict[str, Any]:
                 close_position=False,
                 quantity=half_qty,
                 reduce_only=True,
-                client_algo_id=f"mnt3q{int(time.time())}",
+                client_algo_id=q_cid,
             ),
         )
+        if algo_qty.get("algoId"):
+            created_algo_ids.add(int(algo_qty["algoId"]))
         algo_qty_queried = client.request("GET", "/fapi/v1/algoOrder", params={"algoId": algo_qty["algoId"]})
 
         # 2. closePosition=true algoOrder with CONTRACT_PRICE (omitting quantity & reduceOnly)
+        cp_cid = f"mnt3c{int(time.time())}"
+        created_client_ids.add(cp_cid)
         algo_cp = client.request(
             "POST",
             "/fapi/v1/algoOrder",
@@ -1282,17 +1515,20 @@ def run_live_demo_suite(*, symbol: str = "SOLUSDT") -> dict[str, Any]:
                 trigger_price=cp_px,
                 working_type="CONTRACT_PRICE",
                 close_position=True,
-                client_algo_id=f"mnt3c{int(time.time())}",
+                client_algo_id=cp_cid,
             ),
         )
+        if algo_cp.get("algoId"):
+            created_algo_ids.add(int(algo_cp["algoId"]))
         open_algos_seen = client.request("GET", "/fapi/v1/openAlgoOrders", params={"symbol": symbol})
         client.request("DELETE", "/fapi/v1/algoOrder", params={"algoId": algo_qty["algoId"]})
 
         # 3. Attempt live conditional trigger -> child actualOrderId & userTrades correlation
-        # Place tight TAKE_PROFIT_MARKET (+0.02) and STOP_MARKET (-0.02) for 0.10 qty CONTRACT_PRICE
         for offset in (Decimal("0.02"), Decimal("0.05"), Decimal("0.10")):
             try:
                 t_now = Decimal(str(_fetch_json(f"https://demo-fapi.binance.com/fapi/v1/ticker/price?symbol={symbol}")["price"]))
+                tp_cid = f"mnt3tp{int(time.time() * 1000) % 1000000}"
+                created_client_ids.add(tp_cid)
                 algo_tp_trig = client.request(
                     "POST",
                     "/fapi/v1/algoOrder",
@@ -1305,15 +1541,19 @@ def run_live_demo_suite(*, symbol: str = "SOLUSDT") -> dict[str, Any]:
                         close_position=False,
                         quantity=half_qty,
                         reduce_only=True,
-                        client_algo_id=f"mnt3tp{int(time.time() * 1000) % 1000000}",
+                        client_algo_id=tp_cid,
                     ),
                 )
+                if algo_tp_trig.get("algoId"):
+                    created_algo_ids.add(int(algo_tp_trig["algoId"]))
                 break
             except RuntimeError:
                 continue
         for offset in (Decimal("0.02"), Decimal("0.05"), Decimal("0.10")):
             try:
                 t_now = Decimal(str(_fetch_json(f"https://demo-fapi.binance.com/fapi/v1/ticker/price?symbol={symbol}")["price"]))
+                sl_cid = f"mnt3sl{int(time.time() * 1000) % 1000000}"
+                created_client_ids.add(sl_cid)
                 algo_sl_trig = client.request(
                     "POST",
                     "/fapi/v1/algoOrder",
@@ -1326,9 +1566,11 @@ def run_live_demo_suite(*, symbol: str = "SOLUSDT") -> dict[str, Any]:
                         close_position=False,
                         quantity=half_qty,
                         reduce_only=True,
-                        client_algo_id=f"mnt3sl{int(time.time() * 1000) % 1000000}",
+                        client_algo_id=sl_cid,
                     ),
                 )
+                if algo_sl_trig.get("algoId"):
+                    created_algo_ids.add(int(algo_sl_trig["algoId"]))
                 break
             except RuntimeError:
                 continue
@@ -1346,30 +1588,35 @@ def run_live_demo_suite(*, symbol: str = "SOLUSDT") -> dict[str, Any]:
 
         if triggered_algo is not None and triggered_algo.get("actualOrderId"):
             child_oid = int(triggered_algo["actualOrderId"])
+            created_order_ids.add(child_oid)
             triggered_child_order = client.request("GET", "/fapi/v1/order", params={"symbol": symbol, "orderId": child_oid})
             all_tr = client.request("GET", "/fapi/v1/userTrades", params={"symbol": symbol, "startTime": t_start_ms, "limit": 50})
             triggered_child_trades = [t for t in all_tr if int(t.get("orderId", -1)) == child_oid]
     finally:
-        # Cancel ALL remaining open algo & regular orders, flatten remaining position cleanly
+        # Scoped cleanup: cancel ONLY orders/algos belonging to THIS run and close ONLY opened run qty!
         for o in client.request("GET", "/fapi/v1/openAlgoOrders", params={"symbol": symbol}):
-            try:
-                client.request("DELETE", "/fapi/v1/algoOrder", params={"algoId": o["algoId"]})
-            except Exception:
-                pass
+            if int(o.get("algoId", -1)) in created_algo_ids or str(o.get("clientAlgoId", "")) in created_client_ids:
+                try:
+                    client.request("DELETE", "/fapi/v1/algoOrder", params={"algoId": o["algoId"]})
+                except Exception:
+                    pass
         for o in client.request("GET", "/fapi/v1/openOrders", params={"symbol": symbol}):
-            try:
-                client.request("DELETE", "/fapi/v1/order", params={"symbol": symbol, "orderId": o["orderId"]})
-            except Exception:
-                pass
-        for p in client.request("GET", "/fapi/v2/positionRisk", params={"symbol": symbol}):
-            amt = Decimal(str(p.get("positionAmt", "0")))
-            if amt != 0:
-                close_side = "SELL" if amt > 0 else "BUY"
-                client.request(
-                    "POST",
-                    "/fapi/v1/order",
-                    params={"symbol": symbol, "side": close_side, "type": "MARKET", "quantity": f"{abs(amt)}", "reduceOnly": True},
-                )
+            if int(o.get("orderId", -1)) in created_order_ids or str(o.get("clientOrderId", "")) in created_client_ids:
+                try:
+                    client.request("DELETE", "/fapi/v1/order", params={"symbol": symbol, "orderId": o["orderId"]})
+                except Exception:
+                    pass
+        if entry:
+            for p in client.request("GET", "/fapi/v2/positionRisk", params={"symbol": symbol}):
+                amt = Decimal(str(p.get("positionAmt", "0")))
+                if amt != 0:
+                    close_qty = min(abs(amt), Decimal(qty))
+                    close_side = "SELL" if amt > 0 else "BUY"
+                    client.request(
+                        "POST",
+                        "/fapi/v1/order",
+                        params={"symbol": symbol, "side": close_side, "type": "MARKET", "quantity": f"{close_qty}", "reduceOnly": True},
+                    )
 
     final_open_orders = client.request("GET", "/fapi/v1/openOrders", params={"symbol": symbol})
     final_open_algos = client.request("GET", "/fapi/v1/openAlgoOrders", params={"symbol": symbol})
@@ -1390,8 +1637,27 @@ def run_live_demo_suite(*, symbol: str = "SOLUSDT") -> dict[str, Any]:
             price=Decimal(str(tr["price"])),
             fee_amount=Decimal(str(tr["commission"])),
             fee_asset=str(tr["commissionAsset"]),
+            fill_id=str(tr["id"]),
+            confirmed_exchange_fill=True,
         )
     ledger_diff = abs(end_wallet - ledger.cross_wallet_usdt)
+
+    sym_pos_rows = [p for p in final_pos if p.get("symbol") == symbol]
+    checks = {
+        "final_open_orders_zero": len(final_open_orders) == 0,
+        "final_open_algos_zero": len(final_open_algos) == 0,
+        "final_pos_present_and_flat": bool(sym_pos_rows) and all(Decimal(str(p.get("positionAmt", "0"))) == 0 for p in sym_pos_rows),
+        "close_position_mutex_rejected": close_pos_mutex_rejected,
+        "triggered_algo_present": bool(triggered_algo and triggered_algo.get("algoId") in created_algo_ids and triggered_algo.get("actualOrderId")),
+        "triggered_child_order_filled": bool(
+            triggered_child_order
+            and str(triggered_child_order.get("orderId")) == str((triggered_algo or {}).get("actualOrderId"))
+            and triggered_child_order.get("status") == "FILLED"
+            and Decimal(str(triggered_child_order.get("executedQty", "0"))) > 0
+        ),
+        "triggered_child_trades_present": bool(triggered_child_trades),
+        "ledger_reconciled": ledger_diff < Decimal("0.000001"),
+    }
 
     return {
         "suite": "live-demo",
@@ -1420,16 +1686,9 @@ def run_live_demo_suite(*, symbol: str = "SOLUSDT") -> dict[str, Any]:
         "end_wallet_usdt": str(end_wallet),
         "hand_ledger_end_usdt": str(ledger.cross_wallet_usdt),
         "wallet_vs_hand_ledger_diff": str(ledger_diff),
+        "checks": checks,
         "audit_log": redact_sensitive(client.audit_log),
-        "status": "PASSED"
-        if (
-            len(final_open_orders) == 0
-            and len(final_open_algos) == 0
-            and all(Decimal(str(p.get("positionAmt", "0"))) == 0 for p in final_pos)
-            and close_pos_mutex_rejected
-            and ledger_diff < Decimal("0.000001")
-        )
-        else "FAILED",
+        "status": "PASSED" if all(checks.values()) else "FAILED",
     }
 
 
@@ -1446,11 +1705,25 @@ async def _run_live_demo_nautilus_async(*, symbol: str = "SOLUSDT") -> dict[str,
     from nautilus_trader.model import InstrumentId, OrderSide, Price, Quantity, TraderId, TriggerType
     from nautilus_trader.trading import Strategy
 
-    # Pre-clean any stray state and ensure isolated / one-way
+    # Read-only preflight check: never wipe foreign orders/positions or mutate account mode
     dual = rest.request("GET", "/fapi/v1/positionSide/dual")
     if dual.get("dualSidePosition"):
-        rest.request("POST", "/fapi/v1/positionSide/dual", params={"dualSidePosition": False})
+        return {"suite": "live-demo-nautilus", "symbol": symbol, "status": "BLOCKED_ACCOUNT_NOT_ONE_WAY", "execution_enabled": False}
+    pre_oo = rest.request("GET", "/fapi/v1/openOrders", params={"symbol": symbol})
+    pre_oa = rest.request("GET", "/fapi/v1/openAlgoOrders", params={"symbol": symbol})
+    pre_pos = [p for p in rest.request("GET", "/fapi/v2/positionRisk", params={"symbol": symbol}) if Decimal(str(p.get("positionAmt", "0"))) != 0]
+    if pre_oo or pre_oa or pre_pos:
+        return {
+            "suite": "live-demo-nautilus",
+            "symbol": symbol,
+            "status": "BLOCKED_FOREIGN_STATE_PRESENT",
+            "execution_enabled": False,
+            "pre_open_orders": len(pre_oo),
+            "pre_open_algos": len(pre_oa),
+            "pre_positions": pre_pos,
+        }
     inst_id = InstrumentId.from_str(f"{symbol}-PERP.BINANCE")
+    order_qty_str = "0.20" if symbol == "SOLUSDT" else "0.01"
 
     class _LiveDriver(Strategy):
         def __init__(self, cfg: StrategyConfig) -> None:
@@ -1517,9 +1790,9 @@ async def _run_live_demo_nautilus_async(*, symbol: str = "SOLUSDT") -> dict[str,
                         break
                     await asyncio.sleep(0.1)
                 mid = (Decimal(strat.quotes[-1][0]) + Decimal(strat.quotes[-1][1])) / Decimal(2)
-                qty_s = "0.20" if symbol == "SOLUSDT" else "0.01"
+                qty_s = order_qty_str
 
-                # 1. Live MARKET BUY 0.20
+                # 1. Live MARKET BUY
                 o_mkt = strat.order_factory.market(inst_id, OrderSide.BUY, Quantity.from_str(qty_s))
                 strat.submit_order(o_mkt)
                 for _ in range(80):
@@ -1558,6 +1831,8 @@ async def _run_live_demo_nautilus_async(*, symbol: str = "SOLUSDT") -> dict[str,
                     "quotes_seen": len(strat.quotes),
                     "node1_fills": list(strat.fills),
                     "node1_events": list(strat.events),
+                    "node1_stop_client_id": str(o_cp.client_order_id),
+                    "node1_limit_client_id": str(o_lim.client_order_id),
                     "exchange_open_orders": len(rest.request("GET", "/fapi/v1/openOrders", params={"symbol": symbol})),
                     "exchange_open_algos": len(rest.request("GET", "/fapi/v1/openAlgoOrders", params={"symbol": symbol})),
                     "exchange_pos": rest.request("GET", "/fapi/v2/positionRisk", params={"symbol": symbol}),
@@ -1653,53 +1928,112 @@ async def _run_live_demo_nautilus_async(*, symbol: str = "SOLUSDT") -> dict[str,
         node2.dispose()
         return r2
 
+    r1: dict[str, Any] = {}
+    r2: dict[str, Any] = {}
+    fallback_cleanup_actions: list[str] = []
+    pre_fallback_open_orders = 0
+    pre_fallback_open_algos = 0
+    pre_fallback_nonzero_pos = 0
     try:
         r1 = await _node1()
         r2 = await _node2_reconcile_and_cleanup()
+        # Capture post-Node-2 account state BEFORE safety fallback cleanup!
+        pre_fallback_open_orders = len(rest.request("GET", "/fapi/v1/openOrders", params={"symbol": symbol}))
+        pre_fallback_open_algos = len(rest.request("GET", "/fapi/v1/openAlgoOrders", params={"symbol": symbol}))
+        pre_fallback_nonzero_pos = sum(
+            1
+            for p in rest.request("GET", "/fapi/v2/positionRisk", params={"symbol": symbol})
+            if Decimal(str(p.get("positionAmt", "0"))) != 0
+        )
     finally:
-        # Hard safety cleanup on Demo even on failure
+        # Scoped emergency cleanup ONLY for orders/exposure created by THIS run (if native Node 2 failed)
+        run_cids = {str(x) for x in (r1.get("node1_stop_client_id"), r1.get("node1_limit_client_id")) if x}
         for o in rest.request("GET", "/fapi/v1/openAlgoOrders", params={"symbol": symbol}):
-            try:
-                rest.request("DELETE", "/fapi/v1/algoOrder", params={"algoId": o["algoId"]})
-            except Exception:
-                pass
+            if not run_cids or str(o.get("clientAlgoId", "")) in run_cids:
+                try:
+                    rest.request("DELETE", "/fapi/v1/algoOrder", params={"algoId": o["algoId"]})
+                    fallback_cleanup_actions.append(f"cancel_algo:{o['algoId']}")
+                except Exception:
+                    pass
         for o in rest.request("GET", "/fapi/v1/openOrders", params={"symbol": symbol}):
-            try:
-                rest.request("DELETE", "/fapi/v1/order", params={"symbol": symbol, "orderId": o["orderId"]})
-            except Exception:
-                pass
-        for p in rest.request("GET", "/fapi/v2/positionRisk", params={"symbol": symbol}):
-            amt = Decimal(str(p.get("positionAmt", "0")))
-            if amt != 0:
-                rest.request(
-                    "POST",
-                    "/fapi/v1/order",
-                    params={"symbol": symbol, "side": ("SELL" if amt > 0 else "BUY"), "type": "MARKET", "quantity": f"{abs(amt)}", "reduceOnly": True},
-                )
+            if not run_cids or str(o.get("clientOrderId", "")) in run_cids:
+                try:
+                    rest.request("DELETE", "/fapi/v1/order", params={"symbol": symbol, "orderId": o["orderId"]})
+                    fallback_cleanup_actions.append(f"cancel_order:{o['orderId']}")
+                except Exception:
+                    pass
+        if r1.get("node1_fills") and pre_fallback_nonzero_pos > 0:
+            for p in rest.request("GET", "/fapi/v2/positionRisk", params={"symbol": symbol}):
+                amt = Decimal(str(p.get("positionAmt", "0")))
+                if amt != 0:
+                    close_qty = min(abs(amt), Decimal(order_qty_str))
+                    rest.request(
+                        "POST",
+                        "/fapi/v1/order",
+                        params={"symbol": symbol, "side": ("SELL" if amt > 0 else "BUY"), "type": "MARKET", "quantity": f"{close_qty}", "reduceOnly": True},
+                    )
+                    fallback_cleanup_actions.append(f"flatten_pos:{close_qty}")
 
     final_oo = rest.request("GET", "/fapi/v1/openOrders", params={"symbol": symbol})
     final_oa = rest.request("GET", "/fapi/v1/openAlgoOrders", params={"symbol": symbol})
     final_pos = rest.request("GET", "/fapi/v2/positionRisk", params={"symbol": symbol})
-    ok = (
-        len(r1["node1_fills"]) >= 1
-        and r1["exchange_open_orders"] == 1
-        and r1["exchange_open_algos"] == 1
-        and len(r2["reconciled_open_orders"]) >= 2
-        and any(o["order_type"] == "STOP_MARKET" and o["qty"] == "0.20" and o["is_reduce_only"] for o in r2["reconciled_open_orders"])
-        and any(o["order_type"] == "LIMIT" for o in r2["reconciled_open_orders"])
-        and len(final_oo) == 0
-        and len(final_oa) == 0
-        and all(Decimal(str(p.get("positionAmt", "0"))) == 0 for p in final_pos)
-    )
+    sym_pos_rows = [p for p in final_pos if p.get("symbol") == symbol]
+
+    rec_orders = r2.get("reconciled_open_orders", [])
+    rec_positions = r2.get("reconciled_open_positions", [])
+    rec_events = r2.get("node2_events", [])
+    stop_cid = str(r1.get("node1_stop_client_id", ""))
+    lim_cid = str(r1.get("node1_limit_client_id", ""))
+    checks = {
+        "node1_filled": len(r1.get("node1_fills", [])) >= 1 and Decimal(str(r1["node1_fills"][0]["qty"])) == Decimal(order_qty_str),
+        "node1_left_open_orders": r1.get("exchange_open_orders") == 1 and r1.get("exchange_open_algos") == 1,
+        "node2_reconciled_exact_stop_id_qty": any(
+            o["client_order_id"] == stop_cid
+            and o["order_type"] == "STOP_MARKET"
+            and Decimal(str(o["qty"])) == Decimal(order_qty_str)
+            and o["is_reduce_only"]
+            for o in rec_orders
+        ),
+        "node2_reconciled_exact_limit_id": any(
+            o["client_order_id"] == lim_cid and o["order_type"] == "LIMIT" for o in rec_orders
+        ),
+        "node2_reconciled_signed_position": any(
+            p["instrument_id"] == str(inst_id) and p["side"] == "LONG" and Decimal(str(p["signed_qty"])) == Decimal(order_qty_str)
+            for p in rec_positions
+        ),
+        "node2_canceled_both_natively": f"CANCELED:{stop_cid}" in rec_events and f"CANCELED:{lim_cid}" in rec_events,
+        "node2_flattened_natively": (
+            len(r2.get("node2_fills", [])) >= 1
+            and sum((Decimal(str(f["qty"])) for f in r2.get("node2_fills", [])), Decimal(0)) == Decimal(order_qty_str)
+            and pre_fallback_open_orders == 0
+            and pre_fallback_open_algos == 0
+            and pre_fallback_nonzero_pos == 0
+            and not fallback_cleanup_actions
+        ),
+        "final_clean": (
+            len(final_oo) == 0
+            and len(final_oa) == 0
+            and bool(sym_pos_rows)
+            and all(Decimal(str(p.get("positionAmt", "0"))) == 0 for p in sym_pos_rows)
+        ),
+    }
     return {
         "suite": "live-demo-nautilus",
         "symbol": symbol,
+        "order_qty": order_qty_str,
         "node1": r1,
         "node2": r2,
+        "pre_fallback_counts": {
+            "open_orders": pre_fallback_open_orders,
+            "open_algos": pre_fallback_open_algos,
+            "nonzero_positions": pre_fallback_nonzero_pos,
+        },
+        "fallback_cleanup_actions": fallback_cleanup_actions,
         "final_open_orders_count": len(final_oo),
         "final_open_algos_count": len(final_oa),
         "final_position": final_pos,
-        "status": "PASSED" if ok else "FAILED",
+        "checks": checks,
+        "status": "PASSED" if all(checks.values()) else "FAILED",
     }
 
 
@@ -1707,21 +2041,30 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="M-NT3 USD-M Perpetual Verification Harness")
     parser.add_argument(
         "--suite",
-        choices=("all", "public-specs", "accounting-parity", "mock-demo-e2e", "live-demo", "live-demo-nautilus"),
-        default="all",
+        choices=(
+            "offline",
+            "public-specs",
+            "accounting-parity",
+            "mock-demo-e2e",
+            "live-demo",
+            "live-demo-nautilus",
+            "all-offline",
+            "all-with-live-demo",
+        ),
+        default="offline",
     )
     parser.add_argument("--symbol", default="SOLUSDT")
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args()
 
     out: dict[str, Any] = {}
-    if args.suite in ("all", "public-specs"):
+    if args.suite in ("public-specs", "all-with-live-demo"):
         out["public_specs"] = run_public_specs_suite()
-    if args.suite in ("all", "accounting-parity"):
+    if args.suite in ("offline", "all-offline", "accounting-parity", "all-with-live-demo"):
         out["accounting_parity"] = run_accounting_parity_suite()
-    if args.suite in ("all", "mock-demo-e2e"):
+    if args.suite in ("offline", "all-offline", "mock-demo-e2e", "all-with-live-demo"):
         out["mock_demo_e2e"] = asyncio.run(_run_mock_demo_e2e_async())
-    if args.suite in ("all", "live-demo"):
+    if args.suite in ("live-demo", "all-with-live-demo"):
         out["live_demo"] = run_live_demo_suite(symbol=args.symbol)
     if args.suite == "live-demo-nautilus":
         out["live_demo_nautilus"] = asyncio.run(_run_live_demo_nautilus_async(symbol=args.symbol))
@@ -1731,7 +2074,8 @@ def main() -> int:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(payload + "\n", encoding="utf-8")
     print(payload)
-    return 0
+    all_passed = bool(out) and all(isinstance(v, dict) and v.get("status") == "PASSED" for v in out.values())
+    return 0 if all_passed else 1
 
 
 if __name__ == "__main__":

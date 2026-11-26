@@ -257,7 +257,11 @@ def _matches_chunk_filters(
     if symbol_filter and c_symbol not in {"__MIXED__", "__GLOBAL__"} and c_symbol not in symbol_filter:
         return False
     if norm_stream_filter and c_stream != "__MIXED__":
-        if _normalize_manifest_stream(c_stream) not in norm_stream_filter:
+        norm_c = _normalize_manifest_stream(c_stream)
+        matches = norm_c in norm_stream_filter or (
+            norm_c == Stream.REFERENCE_DATA.value and Stream.ORDERBOOK.value in norm_stream_filter
+        )
+        if not matches:
             return False
     if min_utc_ns is not None and c_max is not None and int(c_max) < min_utc_ns:
         return False
@@ -528,7 +532,11 @@ def read_recorder_events(
                 continue
             if symbol_filter and env.symbol not in {"__GLOBAL__", "__MIXED__"} and env.symbol not in symbol_filter:
                 continue
-            if norm_stream_filter and _normalize_manifest_stream(env.stream) not in norm_stream_filter:
+            norm_env_stream = _normalize_manifest_stream(env.stream)
+            if norm_stream_filter and not (
+                norm_env_stream in norm_stream_filter
+                or (norm_env_stream == Stream.REFERENCE_DATA.value and Stream.ORDERBOOK.value in norm_stream_filter)
+            ):
                 continue
             res = parse_raw_record(
                 market=mkt,
@@ -820,6 +828,81 @@ class L2SequenceBridge:
         self.last_update_id = None
         return clear
 
+    def reset(self) -> None:
+        self.synced = False
+        self.bridged = False
+        self.last_update_id = None
+
+    def seed_snapshot_id(self, last_update_id: int) -> None:
+        self.synced = False
+        self.bridged = False
+        self.last_update_id = int(last_update_id)
+
+    def step_sequence(
+        self,
+        *,
+        market: Market,
+        first_update_id: int,
+        final_update_id: int,
+        previous_final_update_id: int | None,
+        quality_flags: tuple[str, ...] = (),
+    ) -> tuple[bool, bool]:
+        """Validate & advance L2 sequence state matching Binance / Nautilus `sync.rs`.
+
+        Returns ``(apply_levels, gap_detected)``.
+        - Spot unlinked/linked: ignore `u <= prev`, GAP if `U > prev + 1`.
+        - USD-M unlinked: ignore `u < prev`, GAP if `U > prev` (must cover `prev` via `U <= lastUpdateId <= u`);
+          when `u == prev`, marks bridged+synced while suppressing level changes already inside snapshot.
+        - USD-M linked: strictly require `pu == prev` (both missing `pu` and mismatched `pu` declare GAP).
+        """
+        if "sequence_gap" in quality_flags:
+            self.gaps_detected += 1
+            self.reset()
+            return False, True
+        if self.last_update_id is None:
+            return False, False
+
+        snap_or_prev = self.last_update_id
+        if not self.bridged:
+            if market == Market.USDM:
+                if final_update_id < snap_or_prev:
+                    return False, False
+                if first_update_id > snap_or_prev:
+                    self.gaps_detected += 1
+                    self.reset()
+                    return False, True
+                self.bridged = True
+                self.synced = True
+                if final_update_id == snap_or_prev:
+                    return False, False
+            else:
+                if final_update_id <= snap_or_prev:
+                    return False, False
+                if first_update_id > snap_or_prev + 1:
+                    self.gaps_detected += 1
+                    self.reset()
+                    return False, True
+                self.bridged = True
+                self.synced = True
+        else:
+            if market == Market.USDM:
+                if previous_final_update_id is None or previous_final_update_id != snap_or_prev:
+                    self.gaps_detected += 1
+                    self.reset()
+                    return False, True
+                if final_update_id <= snap_or_prev:
+                    return False, False
+            else:
+                if final_update_id <= snap_or_prev:
+                    return False, False
+                if first_update_id > snap_or_prev + 1:
+                    self.gaps_detected += 1
+                    self.reset()
+                    return False, True
+
+        self.last_update_id = int(final_update_id)
+        return True, False
+
     def apply_depth_update(
         self,
         *,
@@ -846,43 +929,40 @@ class L2SequenceBridge:
             RecordFlag,
         )
 
-        if "sequence_gap" in quality_flags:
-            return self.on_gap(instrument, ts_event, ts_init), True
-        if self.last_update_id is None:
+        prev_uid_for_clear = self.last_update_id
+        apply_levels, gap_detected = self.step_sequence(
+            market=market,
+            first_update_id=first_update_id,
+            final_update_id=final_update_id,
+            previous_final_update_id=previous_final_update_id,
+            quality_flags=quality_flags,
+        )
+        if gap_detected:
+            from nautilus_trader.model import (
+                BookAction as BA,
+                BookOrder as BO,
+                OrderBookDelta as OBD,
+                OrderBookDeltas as OBDs,
+                OrderSide as OS,
+                Price as P,
+                Quantity as Q,
+                RecordFlag as RF,
+            )
+
+            clear = OBD(
+                instrument.id,
+                BA.CLEAR,
+                BO(OS.BUY, P.from_str("0"), Q.from_str("0"), 0),
+                RF.F_LAST.value,
+                prev_uid_for_clear or 0,
+                ts_event,
+                ts_init,
+            )
+            return OBDs(instrument.id, [clear]), True
+        if not apply_levels:
             return None, False
 
-        snap_or_prev = self.last_update_id
-        if not self.bridged:
-            if market == Market.USDM:
-                if final_update_id < snap_or_prev:
-                    return None, False
-                bridges_snap = first_update_id <= snap_or_prev <= final_update_id
-                continues_seam = (
-                    previous_final_update_id == snap_or_prev
-                    and first_update_id <= snap_or_prev + 1 <= final_update_id
-                )
-                if not (bridges_snap or continues_seam):
-                    return self.on_gap(instrument, ts_event, ts_init), True
-            else:
-                if final_update_id <= snap_or_prev:
-                    return None, False
-                if first_update_id > snap_or_prev + 1:
-                    return self.on_gap(instrument, ts_event, ts_init), True
-            self.bridged = True
-            self.synced = True
-        else:
-            if final_update_id <= snap_or_prev:
-                return None, False
-            if market == Market.USDM:
-                if previous_final_update_id is not None:
-                    if previous_final_update_id != snap_or_prev:
-                        return self.on_gap(instrument, ts_event, ts_init), True
-                elif first_update_id > snap_or_prev + 1:
-                    return self.on_gap(instrument, ts_event, ts_init), True
-            elif first_update_id > snap_or_prev + 1:
-                return self.on_gap(instrument, ts_event, ts_init), True
-
-        self.last_update_id = final_update_id
+        used_uid = int(self.last_update_id or final_update_id)
         p_dp = instrument.price_precision
         s_dp = instrument.size_precision
         raw_changes: list[tuple[OrderSide, Decimal, Decimal]] = [
@@ -905,7 +985,7 @@ class L2SequenceBridge:
                     action,
                     order,
                     flags,
-                    final_update_id,
+                    used_uid,
                     ts_event,
                     ts_init,
                 )

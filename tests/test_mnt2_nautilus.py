@@ -257,7 +257,7 @@ def test_multi_stream_conversion_and_l2_sequence_gap_recovery() -> None:
             trade_time_ms=base_ns // 1_000_000 + 2,
             buyer_is_maker=False,
         ),
-        # USD-M L2 snapshot (u=500), continuous diff (U=501,u=505,pu=500), GAP diff (pu=499), and resync snapshot (u=600)
+        # USD-M L2 snapshot (u=500), bridging diff (U=499<=500<=u=505), GAP diff (pu=509!=505), and resync snapshot (u=600)
         OrderBookSnapshotEvent(
             venue="BINANCE",
             market=Market.USDM,
@@ -276,9 +276,9 @@ def test_multi_stream_conversion_and_l2_sequence_gap_recovery() -> None:
             delivery_seq=5,
             exchange_event_time_ms=base_ns // 1_000_000 + 4,
             receive_time_utc_ns=base_ns + 4_000_000,
-            first_update_id=501,
+            first_update_id=499,
             final_update_id=505,
-            previous_final_update_id=500,
+            previous_final_update_id=498,
             bids=[(Decimal("60000.5"), Decimal("3.000"))],
             asks=[],
         ),

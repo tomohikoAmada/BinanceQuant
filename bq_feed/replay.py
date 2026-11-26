@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
@@ -51,6 +52,8 @@ _MARKET_TO_RECORDER_CANDIDATES: dict[Market, tuple[str, ...]] = {
 _STREAM_ALIASES: dict[str, str] = {
     "rest_observations": Stream.REFERENCE_DATA.value,
     "reference_data": Stream.REFERENCE_DATA.value,
+    "orderbook": Stream.ORDERBOOK.value,
+    "orderbook_snapshot": Stream.ORDERBOOK.value,
     "book_ticker": Stream.BOOK_TICKER.value,
     "bookTicker": Stream.BOOK_TICKER.value,
     "agg_trade": Stream.AGG_TRADE.value,
@@ -261,6 +264,48 @@ def parse_raw_record(
     return None
 
 
+_INVALID_SNAPSHOT_FLAGS = frozenset(
+    {"malformed", "depth_snapshot_superseded", "depth_snapshot_too_old"}
+)
+
+
+def _decode_provenance_envelope(
+    obj: dict[str, Any],
+    *,
+    default_symbol: str,
+    rest_kind: str | None,
+    quality_flags: tuple[str, ...],
+) -> tuple[str, str, Any, str | None]:
+    """Decode Recorder `binance-public-rest-provenance.v1` envelope -> (source_stream, symbol, model, invalid_reason)."""
+    request = obj.get("request") if isinstance(obj.get("request"), dict) else {}
+    params = request.get("parameters") if isinstance(request.get("parameters"), dict) else {}
+    resolved_symbol = str(params.get("symbol") or default_symbol)
+    source_stream = str(rest_kind or obj.get("source_stream") or "reference_data")
+    response = obj.get("response") if isinstance(obj.get("response"), dict) else {}
+    status = response.get("status")
+    valid = response.get("valid")
+
+    bad_flags = _INVALID_SNAPSHOT_FLAGS.intersection(quality_flags)
+    if bad_flags or valid is False or not isinstance(status, int) or status < 200 or status >= 300:
+        reason = ",".join(sorted(bad_flags)) if bad_flags else str(response.get("error_type") or f"HTTP_{status}")
+        return source_stream, resolved_symbol, None, f"INVALID:{reason}"
+
+    rep = obj.get("representation")
+    try:
+        if rep == "http-body-base64.v1":
+            b64 = response.get("raw_body_base64")
+            if not isinstance(b64, str):
+                return source_stream, resolved_symbol, None, "MISSING_RAW_BODY_BASE64"
+            model = json.loads(base64.b64decode(b64, validate=True).decode("utf-8"))
+        elif rep == "sdk-parsed-json.v1":
+            model = response.get("model")
+        else:
+            return source_stream, resolved_symbol, None, f"UNSUPPORTED_REP:{rep}"
+    except Exception as exc:
+        return source_stream, resolved_symbol, None, f"DECODE_ERROR:{exc}"
+    return source_stream, resolved_symbol, model, None
+
+
 def _parse_rest_payload(
     *,
     mkt: Market,
@@ -273,7 +318,62 @@ def _parse_rest_payload(
     source: str,
     venue: str,
 ) -> FeedEvent | list[FeedEvent] | None:
-    if isinstance(obj, dict) and "lastUpdateId" in obj and ("bids" in obj or "asks" in obj):
+    if isinstance(obj, dict) and obj.get("schema_version") == "binance-public-rest-provenance.v1":
+        src_stream, resolved_sym, model, invalid_reason = _decode_provenance_envelope(
+            obj,
+            default_symbol=symbol,
+            rest_kind=rest_kind,
+            quality_flags=quality_flags,
+        )
+        if invalid_reason is not None or model is None:
+            return ReferenceObservationEvent(
+                venue=venue,
+                market=mkt,
+                symbol=resolved_sym,
+                source_kind=src_stream,
+                status=invalid_reason or "INVALID",
+                payload_json=json.dumps(obj, separators=(",", ":"), sort_keys=True),
+                source_time_ms=_opt_int(obj.get("timestamp") or obj.get("receive_time_ms")),
+                observe_time_utc_ns=receive_time_utc_ns,
+                receive_time_utc_ns=receive_time_utc_ns,
+                receive_monotonic_ns=receive_monotonic_ns,
+                source=source,
+                quality_flags=quality_flags,
+            )
+        if src_stream == "depth_snapshot" and isinstance(model, dict) and "lastUpdateId" in model:
+            return OrderBookSnapshotEvent(
+                venue=venue,
+                market=mkt,
+                symbol=resolved_sym,
+                last_update_id=int(model["lastUpdateId"]),
+                bids=_parse_levels(model.get("bids", ())),
+                asks=_parse_levels(model.get("asks", ())),
+                is_baseline=True,
+                exchange_event_time_ms=_opt_int(model.get("E")),
+                exchange_transaction_time_ms=_opt_int(model.get("T")),
+                receive_time_utc_ns=receive_time_utc_ns,
+                receive_monotonic_ns=receive_monotonic_ns,
+                source=source,
+                quality_flags=quality_flags,
+            )
+        return _parse_rest_payload(
+            mkt=mkt,
+            symbol=resolved_sym,
+            obj=model,
+            rest_kind=src_stream,
+            receive_time_utc_ns=receive_time_utc_ns,
+            receive_monotonic_ns=receive_monotonic_ns,
+            quality_flags=quality_flags,
+            source=source,
+            venue=venue,
+        )
+
+    if (
+        isinstance(obj, dict)
+        and "lastUpdateId" in obj
+        and ("bids" in obj or "asks" in obj)
+        and not _INVALID_SNAPSHOT_FLAGS.intersection(quality_flags)
+    ):
         return OrderBookSnapshotEvent(
             venue=venue,
             market=mkt,
@@ -646,7 +746,7 @@ class RecorderReplayFeed:
                 if "sequence_gap" in ev.quality_flags:
                     has_gap = True
                 elif prev_u is not None:
-                    if ev.market == Market.USDM and ev.previous_final_update_id is not None:
+                    if ev.market == Market.USDM:
                         has_gap = ev.previous_final_update_id != prev_u
                     elif ev.first_update_id > prev_u + 1:
                         has_gap = True

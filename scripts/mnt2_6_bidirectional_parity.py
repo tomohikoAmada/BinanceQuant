@@ -160,48 +160,6 @@ def _bidirectional_compare_maps(
     }
 
 
-def _step_l2_bridge_state(
-    state: list[Any],  # [last_update_id: int | None, bridged: bool, synced: bool]
-    market: Market,
-    ev: DepthUpdateEvent,
-) -> tuple[bool, bool]:
-    """Return (apply_update, gap_detected) matching L2SequenceBridge state machine."""
-    if "sequence_gap" in getattr(ev, "quality_flags", ()):
-        state[0], state[1], state[2] = None, False, False
-        return False, True
-    prev = state[0]
-    if prev is None:
-        return False, False
-    u0, u1, pu = ev.first_update_id, ev.final_update_id, ev.previous_final_update_id
-    if not state[1]:
-        if market == Market.USDM:
-            if u1 < prev:
-                return False, False
-            if not ((u0 <= prev <= u1) or (pu == prev and u0 <= prev + 1 <= u1)):
-                state[0], state[1], state[2] = None, False, False
-                return False, True
-        else:
-            if u1 <= prev:
-                return False, False
-            if u0 > prev + 1:
-                state[0], state[1], state[2] = None, False, False
-                return False, True
-        state[1] = True
-        state[2] = True
-    else:
-        if u1 <= prev:
-            return False, False
-        if market == Market.USDM:
-            if (pu is not None and pu != prev) or (pu is None and u0 > prev + 1):
-                state[0], state[1], state[2] = None, False, False
-                return False, True
-        elif u0 > prev + 1:
-            state[0], state[1], state[2] = None, False, False
-            return False, True
-    state[0] = u1
-    return True, False
-
-
 def _digest_events_for_symbol(
     refs: list[VerifiedChunkRef],
     *,
@@ -232,28 +190,64 @@ def _digest_events_for_symbol(
     liq: dict[tuple[int, str, str, str], tuple[str]] = {}
     liq_dups = 0
 
-    bridge_state: list[Any] = [None, False, False]
+    bridge = L2SequenceBridge()
     bids: dict[Decimal, Decimal] = {}
     asks: dict[Decimal, Decimal] = {}
     l2_gaps = 0
     l2_checkpoints: dict[int, tuple[tuple[tuple[str, str], ...], tuple[tuple[str, str], ...]]] = {}
     checkpoint_step_ns = max(1, (t_end_ns - t_start_ns) // max(1, max_book_checkpoints))
     next_ckpt_ns = t_start_ns
+    latest_prewindow_snap: tuple[int, OrderBookSnapshotEvent] | None = None
 
-    # Read per-stream group to bound peak memory cleanly on 5.8 GiB VPS (diff_depth pairs with orderbook_snapshot)
+    # Read per-stream group to bound peak memory cleanly on 5.8 GiB VPS (diff_depth pairs with snapshots/rest_observations)
     groups: dict[str, list[VerifiedChunkRef]] = {}
     for ref in refs:
-        st_key = "l2" if ref.stream in {"diff_depth", "orderbook_snapshot"} else ref.stream
+        st_key = "l2" if ref.stream in {"diff_depth", "orderbook_snapshot", "rest_observations"} else ref.stream
         groups.setdefault(st_key, []).append(ref)
 
     for st_key, st_refs in groups.items():
-        # Sort chunks chronologically and read one chunk at a time to bound peak RSS <350 MiB
+        # Sort chunks chronologically; snapshots/rest_observations before diff_depth so baseline seeds cleanly
         st_refs_sorted = sorted(
             st_refs,
-            key=lambda r: (r.receive_min_ns or 0, 0 if r.stream == "orderbook_snapshot" else 1, r.created_at_utc_ns, r.chunk_id),
+            key=lambda r: (
+                r.receive_min_ns or 0,
+                0 if r.stream in {"orderbook_snapshot", "rest_observations"} else 1,
+                r.created_at_utc_ns,
+                r.chunk_id,
+            ),
         )
         print(f"  [digest] {market.value} {symbol} {st_key}: {len(st_refs_sorted)} chunks", flush=True)
+        # First pass for pre-window valid snapshots so L2 book pre-warms causally before t_start_ns
+        if st_key == "l2":
+            snap_refs = [r for r in st_refs_sorted if r.stream in {"orderbook_snapshot", "rest_observations"}]
+            for sref in snap_refs:
+                if sref.receive_min_ns is not None and sref.receive_min_ns >= t_start_ns:
+                    continue
+                for ev in read_recorder_events(
+                    [sref],
+                    market_filter={market},
+                    symbol_filter={symbol},
+                    stream_filter={"orderbook"},
+                    verify_hashes=True,
+                ):
+                    ts_ev = int(ev.receive_time_utc_ns or 0)
+                    if isinstance(ev, OrderBookSnapshotEvent) and ts_ev < t_start_ns:
+                        if latest_prewindow_snap is None or ts_ev >= latest_prewindow_snap[0]:
+                            latest_prewindow_snap = (ts_ev, ev)
+            if latest_prewindow_snap is not None:
+                _, snap_ev = latest_prewindow_snap
+                bids = {Decimal(p): Decimal(q) for p, q in snap_ev.bids if Decimal(q) > 0}
+                asks = {Decimal(p): Decimal(q) for p, q in snap_ev.asks if Decimal(q) > 0}
+                bridge.seed_snapshot_id(snap_ev.last_update_id)
+
+        warmup_start_ns = latest_prewindow_snap[0] if (st_key == "l2" and latest_prewindow_snap is not None) else t_start_ns
+
         for ref in st_refs_sorted:
+            if st_key != "l2":
+                if ref.receive_max_ns is not None and ref.receive_max_ns < t_start_ns:
+                    continue
+            elif ref.receive_max_ns is not None and ref.receive_max_ns < warmup_start_ns:
+                continue
             evs = read_recorder_events(
                 [ref],
                 market_filter={market},
@@ -262,8 +256,11 @@ def _digest_events_for_symbol(
             )
             for ev in evs:
                 ts = int(ev.receive_time_utc_ns or 0)
-                if ts < t_start_ns or ts >= t_end_ns:
+                if st_key != "l2" and (ts < t_start_ns or ts >= t_end_ns):
                     continue
+                if st_key == "l2" and (ts < warmup_start_ns or ts >= t_end_ns):
+                    continue
+                in_target_window = t_start_ns <= ts < t_end_ns
                 flagged = bool(getattr(ev, "quality_flags", ()))
                 if isinstance(ev, AggTradeEvent):
                     if ev.aggregate_trade_id in agg:
@@ -288,19 +285,28 @@ def _digest_events_for_symbol(
                         bbo_flags += 1
                     bbo[key] = (ev.exchange_transaction_time_ms, ev.exchange_event_time_ms)
                 elif isinstance(ev, OrderBookSnapshotEvent):
-                    bids = {Decimal(p): Decimal(q) for p, q in ev.bids if Decimal(q) > 0}
-                    asks = {Decimal(p): Decimal(q) for p, q in ev.asks if Decimal(q) > 0}
-                    bridge_state[0], bridge_state[1], bridge_state[2] = ev.last_update_id, False, False
+                    if in_target_window or (latest_prewindow_snap is not None and ts >= latest_prewindow_snap[0]):
+                        bids = {Decimal(p): Decimal(q) for p, q in ev.bids if Decimal(q) > 0}
+                        asks = {Decimal(p): Decimal(q) for p, q in ev.asks if Decimal(q) > 0}
+                        bridge.seed_snapshot_id(ev.last_update_id)
                 elif isinstance(ev, DepthUpdateEvent):
-                    key_d = (ev.first_update_id, ev.final_update_id, ev.previous_final_update_id)
-                    if key_d in diff:
-                        diff_dups += 1
-                    if flagged:
-                        diff_flags += 1
-                    diff[key_d] = (len(ev.bids), len(ev.asks))
-                    apply_u, gap_u = _step_l2_bridge_state(bridge_state, market, ev)
+                    if in_target_window:
+                        key_d = (ev.first_update_id, ev.final_update_id, ev.previous_final_update_id)
+                        if key_d in diff:
+                            diff_dups += 1
+                        if flagged:
+                            diff_flags += 1
+                        diff[key_d] = (len(ev.bids), len(ev.asks))
+                    apply_u, gap_u = bridge.step_sequence(
+                        market=market,
+                        first_update_id=ev.first_update_id,
+                        final_update_id=ev.final_update_id,
+                        previous_final_update_id=ev.previous_final_update_id,
+                        quality_flags=ev.quality_flags,
+                    )
                     if gap_u:
-                        l2_gaps += 1
+                        if in_target_window:
+                            l2_gaps += 1
                         bids.clear()
                         asks.clear()
                     elif apply_u:
@@ -316,7 +322,7 @@ def _digest_events_for_symbol(
                                 asks.pop(dp, None)
                             else:
                                 asks[dp] = dq
-                        if bridge_state[2] and ts >= next_ckpt_ns and bids and asks and len(l2_checkpoints) < max_book_checkpoints:
+                        if in_target_window and bridge.synced and ts >= next_ckpt_ns and bids and asks and len(l2_checkpoints) < max_book_checkpoints:
                             top_b = tuple((_norm_dec(p), _norm_dec(bids[p])) for p in sorted(bids.keys(), reverse=True)[:top_n])
                             top_a = tuple((_norm_dec(p), _norm_dec(asks[p])) for p in sorted(asks.keys())[:top_n])
                             l2_checkpoints[ev.final_update_id] = (top_b, top_a)
@@ -375,18 +381,19 @@ def _compare_window(
     }
     for mkt, root in ((Market.SPOT, spot_root), (Market.USDM, usdm_root)):
         streams = (
-            {"agg_trade", "book_ticker", "diff_depth", "orderbook_snapshot"}
+            {"agg_trade", "book_ticker", "diff_depth", "orderbook_snapshot", "rest_observations"}
             if mkt == Market.SPOT
-            else {"agg_trade", "book_ticker", "diff_depth", "orderbook_snapshot", "mark_price", "force_order"}
+            else {"agg_trade", "book_ticker", "diff_depth", "orderbook_snapshot", "rest_observations", "mark_price", "force_order"}
         )
         m_res: dict[str, Any] = {}
         for sym in symbols:
+            # Look back up to 15 minutes for pre-window rest_observations snapshots while bounding diff_depth to 60s pre-window
             left_refs = load_mcp_export_chunks(
                 export_root,
                 market_filter={mkt},
                 symbol_filter={sym},
                 stream_filter=streams,
-                min_utc_ns=t_start_ns - 60_000_000_000,
+                min_utc_ns=t_start_ns - 900_000_000_000,
                 max_utc_ns=t_end_ns + 60_000_000_000,
             )
             right_refs = _scan_direct_archive_chunks(
@@ -394,7 +401,7 @@ def _compare_window(
                 market=mkt,
                 symbols={sym},
                 streams=streams,
-                min_utc_ns=t_start_ns - 60_000_000_000,
+                min_utc_ns=t_start_ns - 900_000_000_000,
                 max_utc_ns=t_end_ns + 60_000_000_000,
             )
             l_dig = _digest_events_for_symbol(left_refs, market=mkt, symbol=sym, t_start_ns=t_start_ns, t_end_ns=t_end_ns)
@@ -766,17 +773,18 @@ async def _run_live_capture_bmd1(
         await asyncio.sleep(duration_secs)
         strat.shutdown_system("live capture complete")
 
-    # Fetch independent baseline REST depth snapshots at capture start so BMDR diff_depth can reconstruct L2 books
+    # Fetch independent baseline REST depth snapshots at capture start across all captured symbols so BMDR diff_depth can reconstruct L2 books
     baseline_snaps: dict[tuple[str, str], dict[str, Any]] = {}
     if not trimmed:
-        for mkt_s, url in (
-            ("SPOT", "https://api.binance.com/api/v3/depth?symbol=BTCUSDT&limit=1000"),
-            ("USDM", "https://fapi.binance.com/fapi/v1/depth?symbol=BTCUSDT&limit=1000"),
-        ):
-            try:
-                baseline_snaps[(mkt_s, "BTCUSDT")] = json.loads(urlopen(url, timeout=8.0).read().decode("utf-8"))
-            except Exception:
-                pass
+        for sym in symbols:
+            for mkt_s, url in (
+                ("SPOT", f"https://api.binance.com/api/v3/depth?symbol={sym}&limit=1000"),
+                ("USDM", f"https://fapi.binance.com/fapi/v1/depth?symbol={sym}&limit=1000"),
+            ):
+                try:
+                    baseline_snaps[(mkt_s, sym)] = json.loads(urlopen(url, timeout=8.0).read().decode("utf-8"))
+                except Exception:
+                    pass
 
     clk_tck = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
     pids = {u: _systemd_main_pid(u) for u in ("bmdg", "sbmdr-recorder@spot", "sbmdr-recorder@usdm")}
@@ -837,15 +845,15 @@ async def _run_live_capture_bmd1(
 
     # Compare Live captured maps against BMDR sealed archive inside [inner_a, inner_b]
     bmdr_spot = _scan_direct_archive_chunks(
-        spot_root, market=Market.SPOT, symbols=set(FIVE_SYMBOLS), streams={"agg_trade", "book_ticker", "diff_depth", "orderbook_snapshot"},
-        min_utc_ns=inner_a - 60_000_000_000, max_utc_ns=inner_b + 60_000_000_000,
+        spot_root, market=Market.SPOT, symbols=set(FIVE_SYMBOLS), streams={"agg_trade", "book_ticker", "diff_depth", "orderbook_snapshot", "rest_observations"},
+        min_utc_ns=inner_a - 600_000_000_000, max_utc_ns=inner_b + 60_000_000_000,
     )
     bmdr_usdm = _scan_direct_archive_chunks(
-        usdm_root, market=Market.USDM, symbols=set(FIVE_SYMBOLS), streams={"agg_trade", "book_ticker", "diff_depth", "orderbook_snapshot", "mark_price"},
-        min_utc_ns=inner_a - 60_000_000_000, max_utc_ns=inner_b + 60_000_000_000,
+        usdm_root, market=Market.USDM, symbols=set(FIVE_SYMBOLS), streams={"agg_trade", "book_ticker", "diff_depth", "orderbook_snapshot", "rest_observations", "mark_price"},
+        min_utc_ns=inner_a - 600_000_000_000, max_utc_ns=inner_b + 60_000_000_000,
     )
 
-    # Build BMDR trade/mark/L2 maps inside [inner_a, inner_b]
+    # Build BMDR trade/mark/L2 maps inside [inner_a, inner_b] using shared L2SequenceBridge
     bmdr_trades: dict[tuple[str, str, int], tuple[str, str]] = {}
     bmdr_quotes: set[tuple[str, str, str, str, str, str]] = set()
     bmdr_marks: dict[tuple[str, int], str] = {}
@@ -853,23 +861,30 @@ async def _run_live_capture_bmd1(
     for mkt, refs in ((Market.SPOT, bmdr_spot), (Market.USDM, bmdr_usdm)):
         mkt_s = "SPOT" if mkt == Market.SPOT else "USDM"
         for sym in FIVE_SYMBOLS:
+            bridge = L2SequenceBridge()
             snap0 = baseline_snaps.get((mkt_s, sym))
             if snap0 is not None:
-                bridge_state: list[Any] = [int(snap0["lastUpdateId"]), False, False]
+                bridge.seed_snapshot_id(int(snap0["lastUpdateId"]))
                 bids: dict[Decimal, Decimal] = {Decimal(p): Decimal(q) for p, q in snap0.get("bids", []) if Decimal(q) > 0}
                 asks: dict[Decimal, Decimal] = {Decimal(p): Decimal(q) for p, q in snap0.get("asks", []) if Decimal(q) > 0}
             else:
-                bridge_state = [None, False, False]
                 bids = {}
                 asks = {}
             for ev in read_recorder_events(refs, market_filter={mkt}, symbol_filter={sym}, verify_hashes=True):
                 ts = int(ev.receive_time_utc_ns or 0)
                 if isinstance(ev, OrderBookSnapshotEvent):
-                    bids = {Decimal(p): Decimal(q) for p, q in ev.bids if Decimal(q) > 0}
-                    asks = {Decimal(p): Decimal(q) for p, q in ev.asks if Decimal(q) > 0}
-                    bridge_state[0], bridge_state[1], bridge_state[2] = ev.last_update_id, False, False
+                    if not bridge.synced:
+                        bids = {Decimal(p): Decimal(q) for p, q in ev.bids if Decimal(q) > 0}
+                        asks = {Decimal(p): Decimal(q) for p, q in ev.asks if Decimal(q) > 0}
+                        bridge.seed_snapshot_id(ev.last_update_id)
                 elif isinstance(ev, DepthUpdateEvent):
-                    apply_u, gap_u = _step_l2_bridge_state(bridge_state, mkt, ev)
+                    apply_u, gap_u = bridge.step_sequence(
+                        market=mkt,
+                        first_update_id=ev.first_update_id,
+                        final_update_id=ev.final_update_id,
+                        previous_final_update_id=ev.previous_final_update_id,
+                        quality_flags=ev.quality_flags,
+                    )
                     if gap_u:
                         bids.clear()
                         asks.clear()
@@ -886,7 +901,7 @@ async def _run_live_capture_bmd1(
                                 asks.pop(dp, None)
                             else:
                                 asks[dp] = dq
-                        if bridge_state[2] and (mkt_s, sym, ev.final_update_id) in tel["l2_snaps"]:
+                        if bridge.synced and (mkt_s, sym, ev.final_update_id) in tel["l2_snaps"]:
                             tb = tuple((_norm_dec(p), _norm_dec(bids[p])) for p in sorted(bids.keys(), reverse=True)[:5])
                             ta = tuple((_norm_dec(p), _norm_dec(asks[p])) for p in sorted(asks.keys())[:5])
                             bmdr_l2[(mkt_s, sym, ev.final_update_id)] = (tb, ta)
@@ -909,6 +924,30 @@ async def _run_live_capture_bmd1(
     exact_l2 = sum(1 for k in common_l2 if tel["l2_snaps"][k] == bmdr_l2[k])
     live_q_keys = set(tel["quotes"].keys())
     common_q = live_q_keys & bmdr_quotes
+
+    per_market_symbol: dict[str, dict[str, Any]] = {}
+    for mkt_s in ("SPOT", "USDM"):
+        for sym in FIVE_SYMBOLS:
+            lt_s = {k for k in live_trades if k[0] == mkt_s and k[1] == sym}
+            bt_s = {k for k in bmdr_trades if k[0] == mkt_s and k[1] == sym}
+            ct_s = lt_s & bt_s
+            ll2_s = {k for k in tel["l2_snaps"] if k[0] == mkt_s and k[1] == sym}
+            bl2_s = {k for k in bmdr_l2 if k[0] == mkt_s and k[1] == sym}
+            cl2_s = ll2_s & bl2_s
+            per_market_symbol[f"{mkt_s}:{sym}"] = {
+                "agg_trade": {
+                    "common_ids": len(ct_s),
+                    "exact_matches": sum(1 for k in ct_s if live_trades[k] == bmdr_trades[k]),
+                    "missed_by_live": len(bt_s - lt_s),
+                    "status": "PENDING_OBSERVATION" if not ct_s else ("PASS" if len(bt_s - lt_s) == 0 and sum(1 for k in ct_s if live_trades[k] == bmdr_trades[k]) == len(ct_s) else "MISMATCH"),
+                },
+                "l2_common_uid_top5": {
+                    "live_sampled_uids": len(ll2_s),
+                    "common_uids": len(cl2_s),
+                    "exact_matches": sum(1 for k in cl2_s if tel["l2_snaps"][k] == bmdr_l2[k]),
+                    "status": "PENDING_OBSERVATION" if not cl2_s else ("PASS" if sum(1 for k in cl2_s if tel["l2_snaps"][k] == bmdr_l2[k]) == len(cl2_s) else "MISMATCH"),
+                },
+            }
 
     return {
         "telemetry": telemetry,
@@ -941,6 +980,7 @@ async def _run_live_capture_bmd1(
                 "exact_top5_matches": exact_l2,
             },
         },
+        "per_market_symbol": per_market_symbol,
     }
 
 

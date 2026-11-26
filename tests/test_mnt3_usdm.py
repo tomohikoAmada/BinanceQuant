@@ -425,9 +425,37 @@ def test_nautilus_usdm_backtest_parity_and_five_symbol_protection() -> None:
     hand = IsolatedUsdmLedger(symbol="SOLUSDT", cross_wallet_usdt=Decimal("50"), leverage=5)
     hand.apply_fill(ts_ns=t0, order_id="f1", side="BUY", qty=Decimal("0.30"), price=Decimal("150.00"), fee_amount=Decimal("0.30") * Decimal("150.00") * Decimal("0.0005"))
     hand.settle_funding(funding_time_ns=t_fund, settled_rate=Decimal("0.001"), settlement_mark_price=Decimal("160.00"), visible_utc_ns=t_fund)
-    stop_fill_px = Decimal(res["fills"][1]["px"])
-    hand.apply_fill(ts_ns=t_fund + 1_000_000_100, order_id="f2", side="SELL", qty=Decimal("0.30"), price=stop_fill_px, fee_amount=Decimal("0.30") * stop_fill_px * Decimal("0.0005"))
-    assert abs(Decimal(res["final_total_usdt"]) - hand.cross_wallet_usdt) < Decimal("0.00000005")
+    expected_contract_stop_px = Decimal("146.90")
+    assert Decimal(res["fills"][1]["px"]) == expected_contract_stop_px
+    hand.apply_fill(ts_ns=t_fund + 1_000_000_100, order_id="f2", side="SELL", qty=Decimal("0.30"), price=expected_contract_stop_px, fee_amount=Decimal("0.30") * expected_contract_stop_px * Decimal("0.0005"))
+    assert Decimal(res["final_total_usdt"]) == hand.cross_wallet_usdt == Decimal("48.97746500")
+
+    # Separate MARK_PRICE LONG stop vs visible L1 bid (146.80 != mark 146.90) -> independent 48.94748000!
+    res_mark_long = run_usdm_backtest(
+        spec=sol_spec,
+        data=[
+            QuoteTick(sol_id, Price.from_str("150.00"), Price.from_str("150.00"), Quantity.from_str("100.00"), Quantity.from_str("100.00"), t0, t0),
+            MarkPriceUpdate(sol_id, Price.from_str("150.00"), t0 + 1_000_000, t0 + 1_000_000),
+            FundingRateUpdate(sol_id, Decimal("0.001"), t0 + 2_000_000, t0 + 2_000_000, interval=None, next_funding_ns=t_fund),
+            MarkPriceUpdate(sol_id, Price.from_str("160.00"), t_fund - 1_000_000, t_fund - 1_000_000),
+            QuoteTick(sol_id, Price.from_str("146.80"), Price.from_str("146.90"), Quantity.from_str("100.00"), Quantity.from_str("100.00"), t_fund + 1_000_000_000, t_fund + 1_000_000_000),
+            MarkPriceUpdate(sol_id, Price.from_str("146.90"), t_fund + 1_000_000_100, t_fund + 1_000_000_100),
+        ],
+        strategy_config=UsdmPerpAuditStrategyConfig(
+            instrument_id=sol_id,
+            allowed_symbol="SOLUSDT",
+            leverage=5,
+            order_qty="0.30",
+            side="BUY",
+            protection_mode="quantity_reduce_only",
+            working_type="MARK_PRICE",
+            stop_distance_pct="0.02",
+        ),
+        starting_usdt=Decimal("50"),
+        leverage=5,
+    )
+    assert Decimal(res_mark_long["fills"][1]["px"]) == Decimal("146.80")
+    assert Decimal(res_mark_long["final_total_usdt"]) == Decimal("48.94748000")
 
     # Verify algoOrder validation rules & secret redaction
     client = SignedUsdmRestClient(api_key="SECRET_KEY", api_secret="SECRET_VAL")
@@ -517,4 +545,155 @@ def test_nautilus_usdm_liquidation_and_close_position_parity() -> None:
     assert len(res_mark["fills"]) == 2
     assert res_mark["fills"][1]["px"] == "146.50"
     assert Decimal(res_mark["net_pos"]) == Decimal(0)
+
+
+def test_team_c_mnt3_p1_fixes(monkeypatch: pytest.MonkeyPatch) -> None:
+    from nautilus_trader.model import InstrumentId, MarkPriceUpdate, Price, Quantity, QuoteTick
+    from bq_nautilus.usdm_runner import UsdmPerpAuditStrategyConfig, run_usdm_backtest
+    from scripts.mnt3_usdm_verify import main as mnt3_main
+
+    sol_spec = _sample_usdm_spec("SOLUSDT")
+    sol_id = InstrumentId.from_str("SOLUSDT-PERP.BINANCE")
+    t0 = 1_700_000_000_000_000_000
+
+    # 1. Equal-qty reversal protection in both quantity_reduce_only & close_position
+    for pmode in ("quantity_reduce_only", "close_position"):
+        res = run_usdm_backtest(
+            spec=sol_spec,
+            data=[
+                QuoteTick(sol_id, Price.from_str("100.00"), Price.from_str("100.01"), Quantity.from_str("10.00"), Quantity.from_str("10.00"), t0, t0),
+                MarkPriceUpdate(sol_id, Price.from_str("100.00"), t0 + 1, t0 + 1),
+                QuoteTick(sol_id, Price.from_str("105.00"), Price.from_str("105.01"), Quantity.from_str("10.00"), Quantity.from_str("10.00"), t0 + 1_000_000_000, t0 + 1_000_000_000),
+                MarkPriceUpdate(sol_id, Price.from_str("105.00"), t0 + 1_000_000_001, t0 + 1_000_000_001),
+                QuoteTick(sol_id, Price.from_str("120.00"), Price.from_str("120.01"), Quantity.from_str("10.00"), Quantity.from_str("10.00"), t0 + 2_000_000_000, t0 + 2_000_000_000),
+                MarkPriceUpdate(sol_id, Price.from_str("120.00"), t0 + 2_000_000_001, t0 + 2_000_000_001),
+            ],
+            strategy_config=UsdmPerpAuditStrategyConfig(
+                instrument_id=sol_id,
+                protection_mode=pmode,
+                working_type="MARK_PRICE",
+                entry_mode="plan_scripted",
+                stop_distance_pct="0.02",
+                scripted_actions=(
+                    {"callback": 1, "side": "BUY", "qty": "0.20"},
+                    {"callback": 2, "side": "SELL", "qty": "0.40"},
+                ),
+            ),
+            starting_usdt=Decimal("50"),
+            leverage=5,
+            liquidation_enabled=False,
+        )
+        assert Decimal(res["net_pos"]) == Decimal(0)
+        assert len(res["fills"]) == 3
+        assert res["fills"][-1]["side"] == "BUY"
+        assert Decimal(res["fills"][-1]["px"]) == Decimal("120.01")
+        prot_sides = [i["side"] for i in res["intents"] if i["kind"].startswith("protection_")]
+        assert prot_sides == ["SELL", "BUY"]
+
+    # Optional close-then-open enforcement rejects single cross-zero order
+    res_block = run_usdm_backtest(
+        spec=sol_spec,
+        data=[
+            QuoteTick(sol_id, Price.from_str("100.00"), Price.from_str("100.01"), Quantity.from_str("10.00"), Quantity.from_str("10.00"), t0, t0),
+            QuoteTick(sol_id, Price.from_str("105.00"), Price.from_str("105.01"), Quantity.from_str("10.00"), Quantity.from_str("10.00"), t0 + 1_000_000_000, t0 + 1_000_000_000),
+        ],
+        strategy_config=UsdmPerpAuditStrategyConfig(
+            instrument_id=sol_id,
+            protection_mode="quantity_reduce_only",
+            entry_mode="plan_scripted",
+            forbid_cross_zero_reversal=True,
+            scripted_actions=(
+                {"callback": 1, "side": "BUY", "qty": "0.20"},
+                {"callback": 2, "side": "SELL", "qty": "0.40"},
+            ),
+        ),
+        starting_usdt=Decimal("50"),
+        leverage=5,
+        liquidation_enabled=False,
+    )
+    assert any(b["reason"] == "FORBID_CROSS_ZERO_REVERSAL" for b in res_block["blocked_risk_actions"])
+    assert Decimal(res_block["net_pos"]) == Decimal("0.20")
+
+    # 2. Funding boundary after-open vs pre-close + cross-before-isolated deduction
+    late = IsolatedUsdmLedger(symbol="SOLUSDT", cross_wallet_usdt=Decimal("50"), leverage=5)
+    late.apply_fill(ts_ns=11, order_id="o-late", side="BUY", qty=Decimal("1"), price=Decimal("100"), fee_amount=Decimal("0"))
+    ent_late = late.settle_funding(funding_time_ns=10, settled_rate=Decimal("0.01"), settlement_mark_price=Decimal("100"), visible_utc_ns=15)
+    late.advance_time(15)
+    assert ent_late.boundary_pos_qty == Decimal(0)
+    assert late.funding_pnl_usdt == Decimal(0)
+
+    payer = IsolatedUsdmLedger(symbol="SOLUSDT", cross_wallet_usdt=Decimal("50"), leverage=5)
+    payer.apply_fill(ts_ns=1, order_id="o-pay", side="BUY", qty=Decimal("1"), price=Decimal("100"), fee_amount=Decimal("0"))
+    payer.advance_time(10)
+    payer.settle_funding(funding_time_ns=10, settled_rate=Decimal("0.01"), settlement_mark_price=Decimal("100"), visible_utc_ns=10)
+    assert payer.cross_wallet_usdt == Decimal("29.00")
+    assert payer.isolated_wallet_usdt == Decimal("20")
+
+    # 3. Reduce-only planner ignores free_collateral=0, blocks flat/wrong-side/over-allocation, enforces closePosition mutex
+    brackets = DEFAULT_USDM_TIER1_BRACKETS["SOLUSDT"]
+    p_exit_zero = plan_usdm_isolated_order(
+        spec=sol_spec, brackets=brackets, leverage=5, side="SELL", order_type="MARKET", ref_price=Decimal("100"),
+        free_collateral_usdt=Decimal("0"), loss_budget_usdt=Decimal("0"), stop_distance_pct=Decimal("0.01"),
+        round_trip_fee_rate=Decimal("0.001"), adverse_slippage_rate=Decimal("0.0005"), taker_fee_rate=Decimal("0.0005"),
+        is_reduce_only=True, current_position_qty=Decimal("0.20"),
+    )
+    assert p_exit_zero.accepted is True and p_exit_zero.qty == Decimal("0.20")
+
+    p_flat = plan_usdm_isolated_order(
+        spec=sol_spec, brackets=brackets, leverage=5, side="SELL", order_type="MARKET", ref_price=Decimal("100"),
+        free_collateral_usdt=Decimal("50"), loss_budget_usdt=Decimal("2"), stop_distance_pct=Decimal("0.01"),
+        round_trip_fee_rate=Decimal("0.001"), adverse_slippage_rate=Decimal("0.0005"), taker_fee_rate=Decimal("0.0005"),
+        is_reduce_only=True, current_position_qty=Decimal("0"),
+    )
+    assert p_flat.accepted is False and p_flat.reject_reason == "NO_OPEN_POSITION_FOR_REDUCE_ONLY"
+
+    p_wrong = plan_usdm_isolated_order(
+        spec=sol_spec, brackets=brackets, leverage=5, side="BUY", order_type="MARKET", ref_price=Decimal("100"),
+        free_collateral_usdt=Decimal("50"), loss_budget_usdt=Decimal("2"), stop_distance_pct=Decimal("0.01"),
+        round_trip_fee_rate=Decimal("0.001"), adverse_slippage_rate=Decimal("0.0005"), taker_fee_rate=Decimal("0.0005"),
+        is_reduce_only=True, current_position_qty=Decimal("0.20"),
+    )
+    assert p_wrong.accepted is False and p_wrong.reject_reason == "WRONG_SIDE_FOR_REDUCE_ONLY"
+
+    p_dup_ro = plan_usdm_isolated_order(
+        spec=sol_spec, brackets=brackets, leverage=5, side="SELL", order_type="MARKET", ref_price=Decimal("100"),
+        free_collateral_usdt=Decimal("50"), loss_budget_usdt=Decimal("2"), stop_distance_pct=Decimal("0.01"),
+        round_trip_fee_rate=Decimal("0.001"), adverse_slippage_rate=Decimal("0.0005"), taker_fee_rate=Decimal("0.0005"),
+        is_reduce_only=True, current_position_qty=Decimal("0.20"), open_reduce_only_qty=Decimal("0.20"),
+    )
+    assert p_dup_ro.accepted is False and p_dup_ro.reject_reason == "REDUCE_ONLY_EXCEEDS_REMAINING_POSITION"
+
+    p_cp = plan_usdm_isolated_order(
+        spec=sol_spec, brackets=brackets, leverage=5, side="SELL", order_type="MARKET", ref_price=Decimal("100"),
+        free_collateral_usdt=Decimal("0"), loss_budget_usdt=Decimal("0"), stop_distance_pct=Decimal("0.01"),
+        round_trip_fee_rate=Decimal("0.001"), adverse_slippage_rate=Decimal("0.0005"), taker_fee_rate=Decimal("0.0005"),
+        is_reduce_only=True, current_position_qty=Decimal("0.20"), close_position=True,
+    )
+    assert p_cp.accepted is True and p_cp.wire_omit_quantity is True and p_cp.wire_omit_reduce_only is True
+
+    # 4. apply_fill atomicity + duplicate fill_id dedup + two partial fills on same order_id
+    atomic = IsolatedUsdmLedger(symbol="SOLUSDT", cross_wallet_usdt=Decimal("50"), leverage=5)
+    atomic.apply_fill(ts_ns=1, order_id="ord-1", side="BUY", qty=Decimal("0.5"), price=Decimal("100"), fee_amount=Decimal("0"), fill_id="t1")
+    atomic.apply_fill(ts_ns=2, order_id="ord-1", side="BUY", qty=Decimal("0.5"), price=Decimal("100"), fee_amount=Decimal("0"), fill_id="t2")
+    atomic.apply_fill(ts_ns=2, order_id="ord-1", side="BUY", qty=Decimal("0.5"), price=Decimal("100"), fee_amount=Decimal("0"), fill_id="t2")  # dup
+    assert atomic.position_qty == Decimal("1")
+    snap_before = (atomic.position_qty, atomic.entry_price, atomic.cross_wallet_usdt, atomic.isolated_wallet_usdt, atomic.clock_ns)
+    with pytest.raises(ValueError, match="Insufficient cross wallet"):
+        atomic.apply_fill(ts_ns=3, order_id="ord-bad", side="BUY", qty=Decimal("2"), price=Decimal("200"), fee_amount=Decimal("0"), fill_id="t3")
+    assert (atomic.position_qty, atomic.entry_price, atomic.cross_wallet_usdt, atomic.isolated_wallet_usdt, atomic.clock_ns) == snap_before
+
+    # 5. evaluate_mark_and_liquidation preserves both pre-liq trigger snapshot and post-liq zero balances
+    liq_l = IsolatedUsdmLedger(symbol="SOLUSDT", cross_wallet_usdt=Decimal("0"), isolated_wallet_usdt=Decimal("50"), leverage=5, auto_allocate_isolated=False)
+    liq_l.apply_fill(ts_ns=10, order_id="liq-1", side="BUY", qty=Decimal("1.00"), price=Decimal("150.00"), fee_amount=Decimal("0.075"))
+    liq_ev = liq_l.evaluate_mark_and_liquidation(ts_ns=20, mark_price=Decimal("100.00"), protection_trigger_price=Decimal("147.00"))
+    assert liq_ev.triggered is True
+    assert liq_ev.position_qty == Decimal("1.00") and liq_ev.isolated_wallet_usdt == Decimal("49.925")
+    assert liq_ev.post_position_qty == Decimal(0) and liq_ev.post_isolated_wallet_usdt == Decimal(0)
+
+    # 6. live-demo without credentials MUST exit non-zero (1)
+    monkeypatch.delenv("BINANCE_DEMO_API_KEY", raising=False)
+    monkeypatch.delenv("BINANCE_DEMO_API_SECRET", raising=False)
+    monkeypatch.setattr("sys.argv", ["mnt3_usdm_verify.py", "--suite", "live-demo"])
+    assert mnt3_main() == 1
+
 

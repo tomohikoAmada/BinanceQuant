@@ -26,8 +26,8 @@ jobs:
       - name: Run pytest
         run: pytest -v
 
-  nautilus-tests:
-    name: Nautilus M-NT1+M-NT2+M-NT2.5+M-NT2.6+M-NT3 tests (Ubuntu 3.13 uv locked)
+  nautilus-bmd2-tests:
+    name: Nautilus M-NT1+M-NT2+M-NT2.5+M-NT2.6+M-NT3 candidate bmd2 (Ubuntu 3.13 uv locked)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -35,11 +35,38 @@ jobs:
       - name: Checkout Contracts Python baseline
         run: |
           git clone --depth 1 https://github.com/tomohikoAmada/BinanceMarketDataContracts.git /tmp/contracts
-      - name: Install locked Python 3.13 environment
+      - name: Download & verify 2.0.0rc9+bmd2 manylinux wheel
+        run: |
+          mkdir -p /tmp/wheelhouse
+          curl -fsSL -o /tmp/wheelhouse/nautilus_trader-2.0.0rc9+bmd2-cp313-cp313-manylinux_2_39_x86_64.whl \
+            "https://github.com/tomohikoAmada/nautilus_trader/releases/download/v2.0.0rc9-bmd2/nautilus_trader-2.0.0rc9%2Bbmd2-cp313-cp313-manylinux_2_39_x86_64.whl"
+          echo "9ddfa22f71502d832eb0e0d88b9af3097ce4ca8ba586394964c9922c10b8678d  /tmp/wheelhouse/nautilus_trader-2.0.0rc9+bmd2-cp313-cp313-manylinux_2_39_x86_64.whl" | sha256sum -c -
+      - name: Install locked Python 3.13 bmd2 candidate environment
+        run: |
+          uv python install 3.13
+          uv venv --python 3.13 .venv-nautilus-bmd2
+          uv pip install --python .venv-nautilus-bmd2/bin/python --find-links /tmp/wheelhouse --require-hashes -r locks/nautilus-bmd2-py313.lock
+          uv pip install --python .venv-nautilus-bmd2/bin/python --no-deps -e /tmp/contracts -e .
+          .venv-nautilus-bmd2/bin/python -c 'from importlib.metadata import version; v = version("nautilus_trader"); assert v == "2.0.0rc9+bmd2", v'
+      - name: Run Nautilus pytest (candidate bmd2, zero fork skips)
+        run: .venv-nautilus-bmd2/bin/python -m pytest -v tests/test_mnt1_nautilus.py tests/test_mnt2_nautilus.py tests/test_mnt2_5_nautilus.py tests/test_mnt2_6_nautilus.py tests/test_mnt3_usdm.py
+
+  nautilus-rc9-compat:
+    name: Nautilus rollback baseline rc9 compatibility (Ubuntu 3.13 uv locked)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Checkout Contracts Python baseline
+        run: |
+          git clone --depth 1 https://github.com/tomohikoAmada/BinanceMarketDataContracts.git /tmp/contracts
+      - name: Install locked Python 3.13 upstream rc9 environment
         run: |
           uv python install 3.13
           uv venv --python 3.13 .venv-nautilus
           uv pip install --python .venv-nautilus/bin/python --require-hashes -r locks/nautilus-py313.lock
           uv pip install --python .venv-nautilus/bin/python --no-deps -e /tmp/contracts -e .
-      - name: Run Nautilus pytest
+      - name: Run Nautilus pytest (upstream rc9 compat)
+        env:
+          BQ_ALLOW_UPSTREAM_RC9: "1"
         run: .venv-nautilus/bin/python -m pytest -v tests/test_mnt1_nautilus.py tests/test_mnt2_nautilus.py tests/test_mnt2_5_nautilus.py tests/test_mnt2_6_nautilus.py tests/test_mnt3_usdm.py
