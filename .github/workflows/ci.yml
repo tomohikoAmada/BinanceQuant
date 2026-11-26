@@ -27,7 +27,7 @@ jobs:
         run: pytest -v
 
   nautilus-tests:
-    name: Nautilus M-NT1+M-NT2+M-NT2.5+M-NT2.6 tests (Ubuntu 3.13 uv locked)
+    name: Nautilus M-NT1+M-NT2+M-NT2.5+M-NT2.6+M-NT3 tests (Ubuntu 3.13 uv locked)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -42,4 +42,4 @@ jobs:
           uv pip install --python .venv-nautilus/bin/python --require-hashes -r locks/nautilus-py313.lock
           uv pip install --python .venv-nautilus/bin/python --no-deps -e /tmp/contracts -e .
       - name: Run Nautilus pytest
-        run: .venv-nautilus/bin/python -m pytest -v tests/test_mnt1_nautilus.py tests/test_mnt2_nautilus.py tests/test_mnt2_5_nautilus.py tests/test_mnt2_6_nautilus.py
+        run: .venv-nautilus/bin/python -m pytest -v tests/test_mnt1_nautilus.py tests/test_mnt2_nautilus.py tests/test_mnt2_5_nautilus.py tests/test_mnt2_6_nautilus.py tests/test_mnt3_usdm.py

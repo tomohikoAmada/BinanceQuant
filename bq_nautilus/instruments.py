@@ -5,7 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal
 import json
-from typing import Any, Iterable
+import time
+from typing import Any, Iterable, Sequence
+import urllib.request
 
 from bq_feed.events import Market, ReferenceObservationEvent
 
@@ -17,9 +19,93 @@ SUPPORTED_BMD_SYMBOLS: tuple[str, ...] = (
     "XRPUSDT",
 )
 
+BINANCE_SPOT_EXCHANGE_INFO_URL = "https://api.binance.com/api/v3/exchangeInfo"
+BINANCE_USDM_LIVE_EXCHANGE_INFO_URL = "https://fapi.binance.com/fapi/v1/exchangeInfo"
+BINANCE_USDM_DEMO_EXCHANGE_INFO_URL = "https://demo-fapi.binance.com/fapi/v1/exchangeInfo"
+
 
 class UnknownInstrumentSpecError(ValueError):
     """Raised per D4 when instrument filters or observation timestamps are unknown."""
+
+
+@dataclass(frozen=True, slots=True)
+class LeverageBracketTier:
+    """One Binance USD-M maintenance margin tier (`leverageBracket`)."""
+
+    tier: int
+    initial_leverage: int
+    notional_floor: Decimal
+    notional_cap: Decimal
+    maint_margin_ratio: Decimal
+    cum: Decimal
+
+
+# Conservative fallback Tier-1 brackets derived from public Binance USD-M specifications
+# (`maintMarginPercent=2.5%` / `requiredMarginPercent=5.0%` upper bound -> 20x, or standard
+# 50x/75x/125x Binance Tier-1 brackets). Live/authenticated flows should prefer signed
+# `/fapi/v1/leverageBracket` observations with explicit `observe_time_utc_ns`.
+DEFAULT_USDM_TIER1_BRACKETS: dict[str, tuple[LeverageBracketTier, ...]] = {
+    "BTCUSDT": (
+        LeverageBracketTier(1, 20, Decimal("0"), Decimal("50000"), Decimal("0.004"), Decimal("0")),
+        LeverageBracketTier(2, 20, Decimal("50000"), Decimal("250000"), Decimal("0.005"), Decimal("50")),
+        LeverageBracketTier(3, 10, Decimal("250000"), Decimal("1000000"), Decimal("0.01"), Decimal("1300")),
+    ),
+    "ETHUSDT": (
+        LeverageBracketTier(1, 20, Decimal("0"), Decimal("25000"), Decimal("0.005"), Decimal("0")),
+        LeverageBracketTier(2, 20, Decimal("25000"), Decimal("250000"), Decimal("0.01"), Decimal("125")),
+    ),
+    "SOLUSDT": (
+        LeverageBracketTier(1, 20, Decimal("0"), Decimal("10000"), Decimal("0.005"), Decimal("0")),
+        LeverageBracketTier(2, 10, Decimal("10000"), Decimal("100000"), Decimal("0.01"), Decimal("50")),
+    ),
+    "BNBUSDT": (
+        LeverageBracketTier(1, 20, Decimal("0"), Decimal("10000"), Decimal("0.005"), Decimal("0")),
+        LeverageBracketTier(2, 10, Decimal("10000"), Decimal("100000"), Decimal("0.01"), Decimal("50")),
+    ),
+    "XRPUSDT": (
+        LeverageBracketTier(1, 20, Decimal("0"), Decimal("10000"), Decimal("0.005"), Decimal("0")),
+        LeverageBracketTier(2, 10, Decimal("10000"), Decimal("100000"), Decimal("0.01"), Decimal("50")),
+    ),
+}
+
+
+def compute_tiered_maintenance_margin(
+    notional: Decimal,
+    brackets: Sequence[LeverageBracketTier],
+) -> tuple[Decimal, LeverageBracketTier]:
+    """Compute Binance USD-M maintenance margin `notional * MMR - cum` for positive notional."""
+    abs_notional = abs(notional)
+    if not brackets:
+        raise UnknownInstrumentSpecError("Empty leverage brackets")
+    ordered = sorted(brackets, key=lambda b: b.notional_floor)
+    chosen = ordered[-1]
+    for tier in ordered:
+        if abs_notional >= tier.notional_floor and abs_notional <= tier.notional_cap:
+            chosen = tier
+            break
+    if abs_notional == Decimal(0):
+        chosen = ordered[0]
+    mm = max(Decimal(0), abs_notional * chosen.maint_margin_ratio - chosen.cum)
+    return mm, chosen
+
+
+def bracket_tiers_from_binance_json(entry: dict[str, Any]) -> tuple[LeverageBracketTier, ...]:
+    """Parse one symbol object from `/fapi/v1/leverageBracket`."""
+    tiers: list[LeverageBracketTier] = []
+    for raw in entry.get("brackets", []):
+        tiers.append(
+            LeverageBracketTier(
+                tier=int(raw["bracket"]),
+                initial_leverage=int(raw["initialLeverage"]),
+                notional_floor=Decimal(str(raw["notionalFloor"])),
+                notional_cap=Decimal(str(raw["notionalCap"])),
+                maint_margin_ratio=Decimal(str(raw["maintMarginRatio"])),
+                cum=Decimal(str(raw.get("cum", "0"))),
+            )
+        )
+    if not tiers:
+        raise UnknownInstrumentSpecError(f"No brackets present for {entry.get('symbol')}")
+    return tuple(sorted(tiers, key=lambda t: t.notional_floor))
 
 
 def _decimal_precision(step: Decimal) -> int:
@@ -61,6 +147,12 @@ class BmdInstrumentSpec:
     max_price: Decimal | None = None
     trading_status: str = "TRADING"
     source: str = "unknown"
+    market_step_size: Decimal | None = None
+    market_min_quantity: Decimal | None = None
+    market_max_quantity: Decimal | None = None
+    margin_init: Decimal | None = None
+    margin_maint: Decimal | None = None
+    contract_type: str | None = None
 
     @property
     def price_precision(self) -> int:
@@ -156,6 +248,8 @@ class BmdInstrumentSpec:
                 min_notional=min_notional_money,
                 max_price=max_px,
                 min_price=min_px,
+                margin_init=self.margin_init,
+                margin_maint=self.margin_maint,
                 info=info,
             )
 
@@ -177,6 +271,8 @@ def spec_from_exchange_info_entry(
     tick_size: Decimal | None = None
     step_size: Decimal | None = None
     market_step_size: Decimal | None = None
+    market_min_qty: Decimal | None = None
+    market_max_qty: Decimal | None = None
     min_notional: Decimal | None = None
     min_qty: Decimal | None = None
     max_qty: Decimal | None = None
@@ -209,6 +305,12 @@ def spec_from_exchange_info_entry(
             raw_step = flt.get("stepSize") or flt.get("step_size")
             if raw_step is not None:
                 market_step_size = Decimal(str(raw_step))
+            raw_mmin = flt.get("minQty") or flt.get("min_qty")
+            raw_mmax = flt.get("maxQty") or flt.get("max_qty")
+            if raw_mmin is not None and Decimal(str(raw_mmin)) > 0:
+                market_min_qty = Decimal(str(raw_mmin))
+            if raw_mmax is not None and Decimal(str(raw_mmax)) > 0:
+                market_max_qty = Decimal(str(raw_mmax))
         elif ft in ("MIN_NOTIONAL", "NOTIONAL"):
             raw_not = flt.get("minNotional") or flt.get("notional") or flt.get("min_notional")
             if raw_not is not None:
@@ -227,6 +329,11 @@ def spec_from_exchange_info_entry(
         entry.get("quoteAsset") or entry.get("quote_asset"),
     )
     status = str(entry.get("status") or entry.get("contractStatus") or entry.get("trading_status") or "TRADING")
+    raw_req_margin = entry.get("requiredMarginPercent") or entry.get("required_margin_percent")
+    raw_maint_margin = entry.get("maintMarginPercent") or entry.get("maint_margin_percent")
+    margin_init = Decimal(str(raw_req_margin)) / Decimal("100") if raw_req_margin is not None else None
+    margin_maint = Decimal(str(raw_maint_margin)) / Decimal("100") if raw_maint_margin is not None else None
+    contract_type = entry.get("contractType") or entry.get("contract_type")
     return BmdInstrumentSpec(
         market=market,
         symbol=symbol,
@@ -243,6 +350,12 @@ def spec_from_exchange_info_entry(
         max_price=max_px,
         trading_status=status,
         source=source,
+        market_step_size=market_step_size,
+        market_min_quantity=market_min_qty,
+        market_max_quantity=market_max_qty,
+        margin_init=margin_init,
+        margin_maint=margin_maint,
+        contract_type=str(contract_type) if contract_type is not None else None,
     )
 
 
@@ -330,10 +443,60 @@ def latest_instrument_spec_as_of(
     return best
 
 
+def fetch_binance_exchange_info_specs(
+    *,
+    market: Market = Market.USDM,
+    symbols: Sequence[str] = SUPPORTED_BMD_SYMBOLS,
+    demo: bool = False,
+    url: str | None = None,
+    timeout_s: float = 10.0,
+) -> dict[str, BmdInstrumentSpec]:
+    """Fetch public Binance Spot/USD-M exchangeInfo and parse contemporaneous BmdInstrumentSpec entries."""
+    target_url = url
+    if target_url is None:
+        if market == Market.USDM:
+            target_url = BINANCE_USDM_DEMO_EXCHANGE_INFO_URL if demo else BINANCE_USDM_LIVE_EXCHANGE_INFO_URL
+        elif market == Market.SPOT:
+            target_url = BINANCE_SPOT_EXCHANGE_INFO_URL
+        else:
+            raise UnknownInstrumentSpecError(f"Unsupported market: {market.value}")
+    req = urllib.request.Request(target_url, headers={"Accept": "application/json", "User-Agent": "BinanceQuant/M-NT3"})
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+    observe_ns = time.time_ns()
+    server_time_ms = int(payload["serverTime"]) if payload.get("serverTime") is not None else None
+    wanted = set(symbols)
+    out: dict[str, BmdInstrumentSpec] = {}
+    src = f"{'demo' if demo else 'live'}_exchange_info"
+    for entry in payload.get("symbols", []):
+        sym = str(entry.get("symbol") or "")
+        if wanted and sym not in wanted:
+            continue
+        out[sym] = spec_from_exchange_info_entry(
+            entry,
+            market=market,
+            observe_time_utc_ns=observe_ns,
+            source_time_ms=server_time_ms,
+            source=src,
+        )
+    missing = [s for s in symbols if s not in out]
+    if missing:
+        raise UnknownInstrumentSpecError(f"Missing symbols in {src} ({market.value}): {missing}")
+    return out
+
+
 __all__ = [
+    "BINANCE_SPOT_EXCHANGE_INFO_URL",
+    "BINANCE_USDM_DEMO_EXCHANGE_INFO_URL",
+    "BINANCE_USDM_LIVE_EXCHANGE_INFO_URL",
     "BmdInstrumentSpec",
+    "DEFAULT_USDM_TIER1_BRACKETS",
+    "LeverageBracketTier",
     "SUPPORTED_BMD_SYMBOLS",
     "UnknownInstrumentSpecError",
+    "bracket_tiers_from_binance_json",
+    "compute_tiered_maintenance_margin",
+    "fetch_binance_exchange_info_specs",
     "latest_instrument_spec_as_of",
     "spec_from_exchange_info_entry",
     "spec_from_reference_event",
