@@ -366,6 +366,17 @@ def test_isolated_liquidation_long_short_threshold_and_gap_sensitivity() -> None
     assert gap_s.triggered is True and gap_s.jumped_through_protection is True
     assert ledger_s.cross_wallet_usdt == Decimal("30")
 
+    # Exact parity against real observed Demo SOLUSDT positionRisk:
+    # entry=71.38, qty=0.20, iso_wallet=2.85045171, Tier-1 MMR=0.01, cum=0 -> exchange reported 57.70478934
+    liq_obs, _, _ = compute_isolated_liquidation_price(
+        position_qty=Decimal("0.20"),
+        entry_price=Decimal("71.38"),
+        isolated_wallet_usdt=Decimal("2.85045171"),
+        brackets=DEFAULT_USDM_TIER1_BRACKETS["SOLUSDT"],
+    )
+    assert liq_obs is not None
+    assert abs(liq_obs - Decimal("57.70478934")) < Decimal("1e-8")
+
 
 def test_nautilus_usdm_backtest_parity_and_five_symbol_protection() -> None:
     pytest.importorskip("nautilus_trader")

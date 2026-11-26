@@ -172,13 +172,20 @@ def _build_verified_chunk_partition(
 
 def test_locked_nautilus_version_and_wheel_manifest() -> None:
     installed_ver = version("nautilus_trader")
-    assert installed_ver in {"2.0.0rc9", "2.0.0rc9+bmd1"}
+    assert installed_ver in {"2.0.0rc9", "2.0.0rc9+bmd1", "2.0.0rc9+bmd2"}
     wheels_json = json.loads((REPO_ROOT / "locks" / "nautilus-2.0.0rc9-wheels.json").read_text(encoding="utf-8"))
     assert wheels_json["version"] == "2.0.0rc9"
     assert wheels_json["commit"] == "da6b57aefdd62b44f675e434ffcfefca7f4025dd"
     assert "manylinux_2_34_x86_64" in wheels_json["wheels_cp313"]
     assert "macosx_11_0_arm64" in wheels_json["wheels_cp313"]
     assert (REPO_ROOT / "locks" / "nautilus-py313.lock").is_file()
+
+    bmd2_json = json.loads((REPO_ROOT / "locks" / "nautilus-2.0.0rc9+bmd2-wheels.json").read_text(encoding="utf-8"))
+    assert bmd2_json["version"] == "2.0.0rc9+bmd2"
+    assert bmd2_json["commit"] == "c48195fe34f99ea871196ed20cc468f8dbab7768"
+    assert "manylinux_2_39_x86_64" in bmd2_json["wheels_cp313"]
+    assert "macosx_11_0_arm64" in bmd2_json["wheels_cp313"]
+    assert (REPO_ROOT / "locks" / "nautilus-bmd2-py313.lock").is_file()
 
 
 def test_vision_csv_microsecond_strict_bool_and_coverage() -> None:

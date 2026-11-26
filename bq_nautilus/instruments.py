@@ -40,31 +40,30 @@ class LeverageBracketTier:
     cum: Decimal
 
 
-# Conservative fallback Tier-1 brackets derived from public Binance USD-M specifications
-# (`maintMarginPercent=2.5%` / `requiredMarginPercent=5.0%` upper bound -> 20x, or standard
-# 50x/75x/125x Binance Tier-1 brackets). Live/authenticated flows should prefer signed
-# `/fapi/v1/leverageBracket` observations with explicit `observe_time_utc_ns`.
+# Fallback brackets aligned to observed Binance USD-M Demo /fapi/v1/leverageBracket (2026-11-26).
+# Live/authenticated flows should prefer signed `/fapi/v1/leverageBracket` observations
+# with explicit `observe_time_utc_ns`.
 DEFAULT_USDM_TIER1_BRACKETS: dict[str, tuple[LeverageBracketTier, ...]] = {
     "BTCUSDT": (
-        LeverageBracketTier(1, 20, Decimal("0"), Decimal("50000"), Decimal("0.004"), Decimal("0")),
-        LeverageBracketTier(2, 20, Decimal("50000"), Decimal("250000"), Decimal("0.005"), Decimal("50")),
-        LeverageBracketTier(3, 10, Decimal("250000"), Decimal("1000000"), Decimal("0.01"), Decimal("1300")),
+        LeverageBracketTier(1, 125, Decimal("0"), Decimal("50000"), Decimal("0.004"), Decimal("0")),
+        LeverageBracketTier(2, 100, Decimal("50000"), Decimal("250000"), Decimal("0.005"), Decimal("50")),
+        LeverageBracketTier(3, 50, Decimal("250000"), Decimal("3000000"), Decimal("0.01"), Decimal("1300")),
     ),
     "ETHUSDT": (
-        LeverageBracketTier(1, 20, Decimal("0"), Decimal("25000"), Decimal("0.005"), Decimal("0")),
-        LeverageBracketTier(2, 20, Decimal("25000"), Decimal("250000"), Decimal("0.01"), Decimal("125")),
+        LeverageBracketTier(1, 100, Decimal("0"), Decimal("100000"), Decimal("0.005"), Decimal("0")),
+        LeverageBracketTier(2, 75, Decimal("100000"), Decimal("250000"), Decimal("0.0065"), Decimal("150")),
     ),
     "SOLUSDT": (
-        LeverageBracketTier(1, 20, Decimal("0"), Decimal("10000"), Decimal("0.005"), Decimal("0")),
-        LeverageBracketTier(2, 10, Decimal("10000"), Decimal("100000"), Decimal("0.01"), Decimal("50")),
+        LeverageBracketTier(1, 50, Decimal("0"), Decimal("50000"), Decimal("0.01"), Decimal("0")),
+        LeverageBracketTier(2, 25, Decimal("50000"), Decimal("150000"), Decimal("0.02"), Decimal("500")),
     ),
     "BNBUSDT": (
-        LeverageBracketTier(1, 20, Decimal("0"), Decimal("10000"), Decimal("0.005"), Decimal("0")),
-        LeverageBracketTier(2, 10, Decimal("10000"), Decimal("100000"), Decimal("0.01"), Decimal("50")),
+        LeverageBracketTier(1, 75, Decimal("0"), Decimal("5000"), Decimal("0.005"), Decimal("0")),
+        LeverageBracketTier(2, 50, Decimal("5000"), Decimal("10000"), Decimal("0.006"), Decimal("5")),
     ),
     "XRPUSDT": (
-        LeverageBracketTier(1, 20, Decimal("0"), Decimal("10000"), Decimal("0.005"), Decimal("0")),
-        LeverageBracketTier(2, 10, Decimal("10000"), Decimal("100000"), Decimal("0.01"), Decimal("50")),
+        LeverageBracketTier(1, 75, Decimal("0"), Decimal("5000"), Decimal("0.005"), Decimal("0")),
+        LeverageBracketTier(2, 50, Decimal("5000"), Decimal("10000"), Decimal("0.006"), Decimal("5")),
     ),
 }
 
