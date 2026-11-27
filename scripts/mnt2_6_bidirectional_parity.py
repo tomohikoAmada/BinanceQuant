@@ -592,6 +592,7 @@ async def _run_live_capture_bmd1(
     usdm_root: Path,
     export_root: Path,
     trimmed: bool = False,
+    wait_seal_secs: float = 75.0,
 ) -> dict[str, Any]:
     from nautilus_trader.adapters.binance import (
         BinanceDataClientConfig,
@@ -644,6 +645,8 @@ async def _run_live_capture_bmd1(
             self.tel.setdefault("marks", {})   # (sym, ts_ms) -> mark_px
             self.tel.setdefault("funding_intervals", set())
             self.tel.setdefault("l2_snaps", {})  # (mkt, sym, u) -> (top5_bids, top5_asks)
+            self.tel.setdefault("_l2_last_sample_el", {})
+            self.tel.setdefault("mark_precisions", {})
             self.tel["_t0"] = time.monotonic()
 
         def on_start(self) -> None:
@@ -693,22 +696,38 @@ async def _run_live_capture_bmd1(
                 return
             sv = ds.instrument_id.symbol.value
             mkt, sym = ("USDM", sv[:-5]) if sv.endswith("-PERP") else ("SPOT", sv)
-            # Sample L2 snapshots cleanly up to ~500 per stream to keep overhead near zero
-            if sum(1 for k in self.tel["l2_snaps"] if k[0] == mkt and k[1] == sym) >= 200:
+            stream_key = (mkt, sym)
+            active_span = max(5.0, duration_secs - 20.0)
+            sample_interval = max(0.25, active_span / 320.0) if duration_secs > 90.0 else 0.0
+            el = time.monotonic() - self.tel["_t0"]
+            last_el = self.tel["_l2_last_sample_el"].get(stream_key, -1e9)
+            if sample_interval > 0.0 and (el - last_el) < sample_interval:
+                return
+            cur_count = sum(1 for k in self.tel["l2_snaps"] if k[0] == mkt and k[1] == sym)
+            if cur_count >= (350 if duration_secs > 90.0 else 200):
                 return
             book = self.cache.order_book(ds.instrument_id)
             if book is None:
                 return
-            top_b = tuple((_norm_dec(str(o.price)), _norm_dec(str(o.size()))) for o in book.bids()[:5])
-            top_a = tuple((_norm_dec(str(o.price)), _norm_dec(str(o.size()))) for o in book.asks()[:5])
+            inst = self.cache.instrument(ds.instrument_id)
+            s_dp = int(inst.size_precision) if inst is not None else 8
+            p_dp = int(inst.price_precision) if inst is not None else 8
+            q_step = Decimal(1).scaleb(-s_dp)
+            p_step = Decimal(1).scaleb(-p_dp)
+            top_b = tuple((_norm_dec(Decimal(str(o.price)).quantize(p_step)), _norm_dec(Decimal(str(o.size())).quantize(q_step))) for o in book.bids()[:5])
+            top_a = tuple((_norm_dec(Decimal(str(o.price)).quantize(p_step)), _norm_dec(Decimal(str(o.size())).quantize(q_step))) for o in book.asks()[:5])
             if top_b and top_a:
                 self.tel["l2_snaps"][(mkt, sym, int(ds.sequence))] = (top_b, top_a)
+                self.tel["_l2_last_sample_el"][stream_key] = el
 
         def on_mark_price(self, mp: MarkPriceUpdate) -> None:
             self.tel["counts"]["marks"] += 1
             if not self._rec(mp):
                 return
             sym = mp.instrument_id.symbol.value[:-5]
+            inst = self.cache.instrument(mp.instrument_id)
+            if inst is not None:
+                self.tel["mark_precisions"][sym] = int(inst.price_precision)
             self.tel["marks"][(sym, int(mp.ts_event) // 1_000_000)] = _norm_dec(mp.value)
 
         def on_funding_rate(self, fr: FundingRateUpdate) -> None:
@@ -773,7 +792,8 @@ async def _run_live_capture_bmd1(
         await asyncio.sleep(duration_secs)
         strat.shutdown_system("live capture complete")
 
-    # Fetch independent baseline REST depth snapshots at capture start across all captured symbols so BMDR diff_depth can reconstruct L2 books
+    # Fetch independent baseline REST depth snapshots right before capture starts so BMDR diff_depth can reconstruct L2 books
+    t_snap0_ns = time.time_ns()
     baseline_snaps: dict[tuple[str, str], dict[str, Any]] = {}
     if not trimmed:
         for sym in symbols:
@@ -835,22 +855,73 @@ async def _run_live_capture_bmd1(
     if trimmed:
         return {"telemetry": telemetry}
 
-    # Wait up to 85s for BMDR to seal chunks covering [t_cap_start, t_cap_end]
+    # Wait up to wait_seal_secs for BMDR to seal chunks covering [inner_a, inner_b]
     t_cap_start = int(tel.get("t_cap_start", time.time_ns() - 60_000_000_000))
     t_cap_end = int(tel.get("t_cap_end", time.time_ns()))
-    # Inner 30s safe sub-window cleanly sealed inside BMDR chunks
+    # Inner safe sub-window cleanly sealed inside BMDR chunks
     inner_a = t_cap_start + 5_000_000_000
     inner_b = max(inner_a + 10_000_000_000, t_cap_end - 5_000_000_000)
-    await asyncio.sleep(75.0)
+
+    def _sealed_coverage_ready() -> tuple[bool, int, int]:
+        req_spot = {(s, st) for s in FIVE_SYMBOLS for st in ("agg_trade", "diff_depth")}
+        req_usdm = {(s, st) for s in FIVE_SYMBOLS for st in ("agg_trade", "diff_depth", "mark_price")}
+        got_spot_max: dict[tuple[str, str], int] = {}
+        for r in _scan_direct_archive_chunks(
+            spot_root,
+            market=Market.SPOT,
+            symbols=set(FIVE_SYMBOLS),
+            streams={"agg_trade", "diff_depth"},
+            min_utc_ns=inner_a - 60_000_000_000,
+            max_utc_ns=inner_b + 1_200_000_000_000,
+        ):
+            k = (r.symbol, r.stream)
+            got_spot_max[k] = max(got_spot_max.get(k, 0), int(r.receive_max_ns or 0))
+        got_usdm_max: dict[tuple[str, str], int] = {}
+        for r in _scan_direct_archive_chunks(
+            usdm_root,
+            market=Market.USDM,
+            symbols=set(FIVE_SYMBOLS),
+            streams={"agg_trade", "diff_depth", "mark_price"},
+            min_utc_ns=inner_a - 60_000_000_000,
+            max_utc_ns=inner_b + 1_200_000_000_000,
+        ):
+            k = (r.symbol, r.stream)
+            got_usdm_max[k] = max(got_usdm_max.get(k, 0), int(r.receive_max_ns or 0))
+        got_spot = {k for k, v in got_spot_max.items() if v >= inner_b}
+        got_usdm = {k for k, v in got_usdm_max.items() if v >= inner_b}
+        total_req = len(req_spot) + len(req_usdm)
+        total_got = len(req_spot & got_spot) + len(req_usdm & got_usdm)
+        return total_got >= total_req, total_got, total_req
+
+    if wait_seal_secs <= 90.0:
+        await asyncio.sleep(max(0.0, wait_seal_secs))
+    else:
+        await asyncio.sleep(30.0)
+        seal_deadline = time.monotonic() + max(0.0, wait_seal_secs - 30.0)
+        while True:
+            ready, got_cnt, req_cnt = _sealed_coverage_ready()
+            print(f"  [wait-seal] covered {got_cnt}/{req_cnt} streams through inner_b", flush=True)
+            if ready or time.monotonic() >= seal_deadline:
+                break
+            await asyncio.sleep(15.0)
 
     # Compare Live captured maps against BMDR sealed archive inside [inner_a, inner_b]
+    depth_min_ns = (t_snap0_ns - 5_000_000_000) if baseline_snaps else (inner_a - 960_000_000_000)
+    fast_min_ns = inner_a - 5_000_000_000
+    fast_max_ns = inner_b + 5_000_000_000
     bmdr_spot = _scan_direct_archive_chunks(
-        spot_root, market=Market.SPOT, symbols=set(FIVE_SYMBOLS), streams={"agg_trade", "book_ticker", "diff_depth", "orderbook_snapshot", "rest_observations"},
-        min_utc_ns=inner_a - 600_000_000_000, max_utc_ns=inner_b + 60_000_000_000,
+        spot_root, market=Market.SPOT, symbols=set(FIVE_SYMBOLS), streams={"diff_depth", "orderbook_snapshot", "rest_observations"},
+        min_utc_ns=depth_min_ns, max_utc_ns=inner_b + 15_000_000_000,
+    ) + _scan_direct_archive_chunks(
+        spot_root, market=Market.SPOT, symbols=set(FIVE_SYMBOLS), streams={"agg_trade", "book_ticker"},
+        min_utc_ns=fast_min_ns, max_utc_ns=fast_max_ns,
     )
     bmdr_usdm = _scan_direct_archive_chunks(
-        usdm_root, market=Market.USDM, symbols=set(FIVE_SYMBOLS), streams={"agg_trade", "book_ticker", "diff_depth", "orderbook_snapshot", "rest_observations", "mark_price"},
-        min_utc_ns=inner_a - 600_000_000_000, max_utc_ns=inner_b + 60_000_000_000,
+        usdm_root, market=Market.USDM, symbols=set(FIVE_SYMBOLS), streams={"diff_depth", "orderbook_snapshot", "rest_observations"},
+        min_utc_ns=depth_min_ns, max_utc_ns=inner_b + 15_000_000_000,
+    ) + _scan_direct_archive_chunks(
+        usdm_root, market=Market.USDM, symbols=set(FIVE_SYMBOLS), streams={"agg_trade", "book_ticker", "mark_price"},
+        min_utc_ns=fast_min_ns, max_utc_ns=fast_max_ns,
     )
 
     # Build BMDR trade/mark/L2 maps inside [inner_a, inner_b] using shared L2SequenceBridge
@@ -870,8 +941,14 @@ async def _run_live_capture_bmd1(
             else:
                 bids = {}
                 asks = {}
-            for ev in read_recorder_events(refs, market_filter={mkt}, symbol_filter={sym}, verify_hashes=True):
+            sym_refs = sorted(
+                (r for r in refs if r.symbol in {sym, "__GLOBAL__", "__MIXED__"}),
+                key=lambda r: (r.receive_min_ns or 0, r.created_at_utc_ns, r.chunk_id),
+            )
+            for ev in read_recorder_events(sym_refs, market_filter={mkt}, symbol_filter={sym}, verify_hashes=True):
                 ts = int(ev.receive_time_utc_ns or 0)
+                if ts >= inner_b + 5_000_000_000:
+                    continue
                 if isinstance(ev, OrderBookSnapshotEvent):
                     if not bridge.synced:
                         bids = {Decimal(p): Decimal(q) for p, q in ev.bids if Decimal(q) > 0}
@@ -912,7 +989,11 @@ async def _run_live_capture_bmd1(
                 elif isinstance(ev, BookTickerEvent):
                     bmdr_quotes.add((mkt_s, sym, _norm_dec(ev.best_bid_price), _norm_dec(ev.best_bid_quantity), _norm_dec(ev.best_ask_price), _norm_dec(ev.best_ask_quantity)))
                 elif isinstance(ev, MarkPriceEvent) and mkt == Market.USDM and ev.exchange_event_time_ms:
-                    bmdr_marks[(sym, int(ev.exchange_event_time_ms))] = _norm_dec(ev.mark_price)
+                    mp_dp = tel.get("mark_precisions", {}).get(sym)
+                    mp_dec = Decimal(str(ev.mark_price))
+                    if mp_dp is not None:
+                        mp_dec = mp_dec.quantize(Decimal(1).scaleb(-int(mp_dp)))
+                    bmdr_marks[(sym, int(ev.exchange_event_time_ms))] = _norm_dec(mp_dec)
 
     # Bidirectional check on common interior trades (Live∩BMDR) + full BMDR keys inside [inner_a, inner_b]
     live_trades = tel["trades"]
@@ -931,15 +1012,27 @@ async def _run_live_capture_bmd1(
             lt_s = {k for k in live_trades if k[0] == mkt_s and k[1] == sym}
             bt_s = {k for k in bmdr_trades if k[0] == mkt_s and k[1] == sym}
             ct_s = lt_s & bt_s
+            lq_s = {k for k in live_q_keys if k[0] == mkt_s and k[1] == sym}
+            bq_s = {k for k in bmdr_quotes if k[0] == mkt_s and k[1] == sym}
+            cq_s = lq_s & bq_s
             ll2_s = {k for k in tel["l2_snaps"] if k[0] == mkt_s and k[1] == sym}
             bl2_s = {k for k in bmdr_l2 if k[0] == mkt_s and k[1] == sym}
             cl2_s = ll2_s & bl2_s
-            per_market_symbol[f"{mkt_s}:{sym}"] = {
+            entry: dict[str, Any] = {
                 "agg_trade": {
+                    "live_total": len(lt_s),
+                    "bmdr_interior_total": len(bt_s),
                     "common_ids": len(ct_s),
                     "exact_matches": sum(1 for k in ct_s if live_trades[k] == bmdr_trades[k]),
                     "missed_by_live": len(bt_s - lt_s),
                     "status": "PENDING_OBSERVATION" if not ct_s else ("PASS" if len(bt_s - lt_s) == 0 and sum(1 for k in ct_s if live_trades[k] == bmdr_trades[k]) == len(ct_s) else "MISMATCH"),
+                },
+                "book_ticker": {
+                    "live_unique": len(lq_s),
+                    "bmdr_interior_unique": len(bq_s),
+                    "common_exact": len(cq_s),
+                    "missed_by_live": len(bq_s - lq_s),
+                    "status": "PENDING_OBSERVATION" if not bq_s else ("PASS" if len(bq_s - lq_s) == 0 else "MISMATCH"),
                 },
                 "l2_common_uid_top5": {
                     "live_sampled_uids": len(ll2_s),
@@ -948,6 +1041,19 @@ async def _run_live_capture_bmd1(
                     "status": "PENDING_OBSERVATION" if not cl2_s else ("PASS" if sum(1 for k in cl2_s if tel["l2_snaps"][k] == bmdr_l2[k]) == len(cl2_s) else "MISMATCH"),
                 },
             }
+            if mkt_s == "USDM":
+                lm_s = {k for k in tel["marks"] if k[0] == sym}
+                bm_s = {k for k in bmdr_marks if k[0] == sym}
+                cm_s = lm_s & bm_s
+                entry["mark_price"] = {
+                    "live_total": len(lm_s),
+                    "bmdr_interior_total": len(bm_s),
+                    "common_ids": len(cm_s),
+                    "exact_matches": sum(1 for k in cm_s if tel["marks"][k] == bmdr_marks[k]),
+                    "missed_by_live": len(bm_s - lm_s),
+                    "status": "PENDING_OBSERVATION" if not cm_s else ("PASS" if len(bm_s - lm_s) == 0 and sum(1 for k in cm_s if tel["marks"][k] == bmdr_marks[k]) == len(cm_s) else "MISMATCH"),
+                }
+            per_market_symbol[f"{mkt_s}:{sym}"] = entry
 
     return {
         "telemetry": telemetry,
@@ -1043,6 +1149,7 @@ def main() -> None:
     parser.add_argument("--usdm-root", type=Path, default=DEFAULT_USDM_ROOT)
     parser.add_argument("--hour-iso", type=str, default=None)
     parser.add_argument("--duration", type=float, default=65.0)
+    parser.add_argument("--wait-seal-secs", type=float, default=75.0)
     parser.add_argument("--trimmed", action="store_true")
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args()
@@ -1062,6 +1169,7 @@ def main() -> None:
                 usdm_root=args.usdm_root,
                 export_root=args.export_root,
                 trimmed=bool(args.trimmed),
+                wait_seal_secs=float(args.wait_seal_secs),
             )
         )
     else:
